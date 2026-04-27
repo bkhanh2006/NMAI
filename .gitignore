@@ -1,0 +1,16 @@
+# Python rác
+__pycache__/
+*.py[cod]
+
+# Các thư mục cache chứa file .json (nặng và không cần thiết)
+**/cache/
+Data/cache/
+graph/cache/
+
+*.graphml
+*.json
+
+# File hệ thống
+.vscode/
+.idea/
+.DS_Store

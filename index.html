@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Map Pro - A* Optimizer</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        #map { height: 100%; width: 100%; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f1f5f9; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900 overflow-hidden h-screen flex flex-col md:flex-row">
+
+    <!-- SIDEBAR -->
+    <aside class="w-full md:w-96 flex flex-col h-full bg-white border-r border-slate-200 shadow-xl z-[2000]">
+        <div class="p-6 bg-gradient-to-r from-slate-900 to-slate-800 text-white">
+            <div class="flex items-center gap-3">
+                <div class="p-2 bg-blue-600 rounded-lg">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 003 16.382V5.618a1 1 0 011.553-.894L9 7m0 13l6.447 3.224A1 1 0 0021 19.382V4.618a1 1 0 00-1.553-.894L15 7m0 13V7m0 0L9 4"></path>
+                    </svg>
+                </div>
+                <div>
+                    <h1 class="text-2xl font-black">Smart Map Pro</h1>
+                    <p class="text-slate-400 text-xs font-bold">ST. PETERSBURG METRO</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="flex-1 overflow-y-auto p-4 custom-scrollbar space-y-4">
+            <div class="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-3">
+                <h3 class="text-xs font-black text-slate-500 uppercase">Tìm Lộ Trình</h3>
+                <div id="point-a-status" class="flex items-center gap-3 text-xs bg-white p-3 rounded-lg border border-slate-200 text-slate-500">
+                    <div class="w-3 h-3 rounded-full bg-green-500"></div>
+                    <span id="point-a-text">Click để chọn điểm A</span>
+                </div>
+                <div id="point-b-status" class="flex items-center gap-3 text-xs bg-white p-3 rounded-lg border border-slate-200 text-slate-500">
+                    <div class="w-3 h-3 rounded-full bg-amber-500"></div>
+                    <span id="point-b-text">Click để chọn điểm B</span>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="calculateRoute()" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg text-xs font-black">TÌM ĐƯỜNG</button>
+                    <button onclick="resetApp()" class="px-4 py-2 border border-slate-300 rounded-lg hover:bg-slate-100">🗑️</button>
+                </div>
+            </div>
+
+            <div class="bg-white p-4 rounded-xl border border-slate-200 space-y-3">
+                <div class="flex gap-2">
+                    <button id="toggle-stations" onclick="toggleStationLayer()" class="flex-1 text-xs font-black rounded-lg border border-blue-200 bg-blue-50 text-slate-700">Hiện tất cả ga</button>
+                    <button id="toggle-walk" onclick="toggleWalkLayer()" class="flex-1 text-xs font-black rounded-lg border border-orange-200 bg-orange-50 text-slate-700">Hiện tất cả điểm đi bộ</button>
+                </div>
+                <div class="text-xs text-slate-500">Chọn để xem toàn bộ điểm trên bản đồ.</div>
+            </div>
+
+            <div id="route-results" class="hidden bg-white border border-blue-200 rounded-xl overflow-hidden">
+                <div class="bg-blue-600 text-white px-4 py-3 flex justify-between">
+                    <span class="text-xs font-black">Chỉ Dẫn Tuyến Đường</span>
+                    <span id="step-count" class="bg-blue-400/30 px-2 py-1 rounded text-xs font-bold">0 ga</span>
+                </div>
+                <div class="p-4 space-y-3">
+                    <div class="text-xs text-slate-600">Bạn sẽ đi qua các ga sau:</div>
+                    <div id="steps-container" class="space-y-2 max-h-56 overflow-y-auto custom-scrollbar"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="p-4 bg-slate-50 border-t border-slate-200">
+            <div id="admin-login-box">
+                <label class="text-xs font-black text-slate-500 uppercase block mb-2">Admin Login</label>
+                <div class="flex gap-2">
+                    <input type="password" id="admin-pass" placeholder="Mật khẩu..." class="flex-1 px-3 py-2 rounded-lg border border-slate-300 text-xs">
+                    <button onclick="loginAdmin()" class="bg-slate-900 text-white px-4 py-2 rounded-lg text-xs font-black">Vào</button>
+                </div>
+            </div>
+
+            <div id="admin-controls" class="hidden space-y-3">
+                <div class="flex justify-between items-center text-xs">
+                    <span class="bg-green-100 text-green-700 px-2 py-1 rounded font-black">✓ ADMIN</span>
+                    <button onclick="logoutAdmin()" class="text-red-500 font-black hover:text-red-700">Thoát</button>
+                </div>
+                <div class="bg-white p-1 rounded-lg border border-slate-200 flex gap-1">
+                    <button id="btn-mode-block" onclick="setAdminMode('block')" class="flex-1 py-2 text-xs font-black rounded bg-red-600 text-white">CẤM</button>
+                    <button id="btn-mode-unblock" onclick="setAdminMode('unblock')" class="flex-1 py-2 text-xs font-black rounded text-slate-400">HỦY</button>
+                </div>
+                <div class="space-y-1">
+                    <button onclick="selectBlockMethod('node')" id="method-node" class="w-full py-2 text-xs font-bold rounded bg-slate-100 hover:bg-blue-100">📍 Cấm Ga</button>
+                    <button onclick="selectBlockMethod('edge')" id="method-edge" class="w-full py-2 text-xs font-bold rounded bg-slate-100 hover:bg-blue-100">🔗 Cấm Cạnh</button>
+                    <button onclick="selectBlockMethod('zone')" id="method-zone" class="w-full py-2 text-xs font-bold rounded bg-slate-100 hover:bg-blue-100">🔴 Cấm Vùng</button>
+                </div>
+                <div id="admin-help-text" class="bg-blue-50 p-2 rounded text-xs text-blue-700 text-center font-medium">Chọn phương thức cấm</div>
+                <button onclick="resetAllForbidden()" class="w-full py-2 text-xs font-black text-slate-500 hover:text-red-600">🔄 Xóa Tất Cả</button>
+            </div>
+        </div>
+    </aside>
+
+    <!-- MAP -->
+    <main class="flex-1 relative bg-white">
+        <div id="map"></div>
+    </main>
+
+    <script>
+        lucide.createIcons();
+        
+        let map = L.map('map').setView([59.9311, 30.3609], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap',
+            maxZoom: 19
+        }).addTo(map);
+
+        let pointA = null, pointB = null;
+        let pointAMarker = null, pointBMarker = null;
+        let routeLayers = [];
+        let allStationLayer = null;
+        let allWalkLayer = null;
+        let stationLayerVisible = false;
+        let walkLayerVisible = false;
+        let forbiddenMarkers = { nodes: [], edges: [], zones: [] };
+        
+        let adminMode = null;
+        let blockMethod = null;
+        let selectedEdge = null;
+        let zonePoints = [];
+
+        // Load graph data
+        async function loadGraphData() {
+            try {
+                const response = await fetch('/api/graph-data');
+                const data = await response.json();
+                window.graphData = data;
+                window.graphNodeMap = new Map(data.nodes.map(node => [node.id, node]));
+                console.log(`✓ Loaded ${data.nodes.length} nodes, ${data.station_nodes.length} stations, ${data.walk_nodes.length} walk points`);
+            } catch (err) {
+                console.error('Error loading graph:', err);
+                alert('Lỗi tải dữ liệu đồ thị');
+            }
+        }
+
+        function createAllStationPointsGeoJSON() {
+            if (!window.graphData) return null;
+            return {
+                type: 'FeatureCollection',
+                features: window.graphData.station_nodes.map(node => ({
+                    type: 'Feature',
+                    properties: { id: node.id, name: node.name },
+                    geometry: { type: 'Point', coordinates: [node.lng, node.lat] }
+                }))
+            };
+        }
+
+        function createAllWalkPointsGeoJSON() {
+            if (!window.graphData) return null;
+            return {
+                type: 'FeatureCollection',
+                features: window.graphData.walk_nodes.map(node => ({
+                    type: 'Feature',
+                    properties: { id: node.id, name: node.name },
+                    geometry: { type: 'Point', coordinates: [node.lng, node.lat] }
+                }))
+            };
+        }
+
+        function createLayer(geojson, options) {
+            return L.geoJSON(geojson, {
+                renderer: L.canvas({ padding: 0.5 }),
+                pointToLayer: (feature, latlng) => L.circleMarker(latlng, options)
+            });
+        }
+
+        function toggleStationLayer() {
+            stationLayerVisible = !stationLayerVisible;
+            const btn = document.getElementById('toggle-stations');
+            if (!allStationLayer) {
+                allStationLayer = createLayer(createAllStationPointsGeoJSON(), {
+                    radius: 3,
+                    fillColor: '#2563eb',
+                    color: '#1d4ed8',
+                    weight: 1,
+                    opacity: 1,
+                    fillOpacity: 0.8
+                });
+            }
+            if (stationLayerVisible) {
+                allStationLayer.addTo(map);
+                btn.textContent = 'Ẩn tất cả ga';
+                btn.className = 'flex-1 text-xs font-black rounded-lg border border-blue-200 bg-blue-600 text-white';
+            } else {
+                map.removeLayer(allStationLayer);
+                btn.textContent = 'Hiện tất cả ga';
+                btn.className = 'flex-1 text-xs font-black rounded-lg border border-blue-200 bg-blue-50 text-slate-700';
+            }
+        }
+
+        function toggleWalkLayer() {
+            walkLayerVisible = !walkLayerVisible;
+            const btn = document.getElementById('toggle-walk');
+            if (!allWalkLayer) {
+                const walkGeoJSON = createAllWalkPointsGeoJSON();
+                if (!walkGeoJSON || walkGeoJSON.features.length === 0) {
+                    walkLayerVisible = false;
+                    btn.textContent = 'Không có điểm đi bộ';
+                    btn.className = 'flex-1 text-xs font-black rounded-lg border border-orange-200 bg-slate-200 text-slate-500';
+                    alert('Dữ liệu hiện không chứa các điểm đi bộ riêng biệt.');
+                    return;
+                }
+                allWalkLayer = createLayer(walkGeoJSON, {
+                    radius: 3,
+                    fillColor: '#f97316',
+                    color: '#c2410c',
+                    weight: 1,
+                    opacity: 1,
+                    fillOpacity: 0.8
+                });
+            }
+            if (walkLayerVisible) {
+                allWalkLayer.addTo(map);
+                btn.textContent = 'Ẩn tất cả điểm đi bộ';
+                btn.className = 'flex-1 text-xs font-black rounded-lg border border-orange-200 bg-orange-600 text-white';
+            } else {
+                map.removeLayer(allWalkLayer);
+                btn.textContent = 'Hiện tất cả điểm đi bộ';
+                btn.className = 'flex-1 text-xs font-black rounded-lg border border-orange-200 bg-orange-50 text-slate-700';
+            }
+        }
+
+        // Map click handler
+        map.on('click', handleMapClick);
+
+        function handleMapClick(e) {
+            const lat = e.latlng.lat;
+            const lng = e.latlng.lng;
+
+            if (adminMode === 'block' && blockMethod) {
+                handleAdminBlockClick(lat, lng);
+                return;
+            }
+
+            if (adminMode === 'unblock' && blockMethod) {
+                handleAdminUnblockClick(lat, lng);
+                return;
+            }
+
+            if (!pointA) {
+                setPointA(lat, lng);
+            } else if (!pointB) {
+                setPointB(lat, lng);
+            }
+        }
+
+        function setPointA(lat, lng) {
+            pointA = { lat, lng };
+            if (pointAMarker) map.removeLayer(pointAMarker);
+            pointAMarker = L.circleMarker([lat, lng], {
+                radius: 8,
+                fillColor: '#22c55e',
+                color: '#16a34a',
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 0.8
+            }).addTo(map);
+            document.getElementById('point-a-text').textContent = `A: ${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+            map.setView([lat, lng], 15);
+        }
+
+        function setPointB(lat, lng) {
+            pointB = { lat, lng };
+            if (pointBMarker) map.removeLayer(pointBMarker);
+            pointBMarker = L.circleMarker([lat, lng], {
+                radius: 8,
+                fillColor: '#f59e0b',
+                color: '#d97706',
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 0.8
+            }).addTo(map);
+            document.getElementById('point-b-text').textContent = `B: ${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+        }
+
+        async function calculateRoute() {
+            if (!pointA || !pointB) {
+                alert('Chọn cả A và B');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/find-path', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pointA, pointB })
+                });
+
+                if (!response.ok) throw new Error(await response.text());
+
+                const result = await response.json();
+                displayRoute(result);
+            } catch (err) {
+                alert(`Lỗi tìm đường: ${err.message}`);
+            }
+        }
+
+        function displayRoute(result) {
+            routeLayers.forEach(layer => map.removeLayer(layer));
+            routeLayers = [];
+
+            const path = result.path;
+            const polylineCoords = path.map(nodeId => {
+                const node = window.graphNodeMap.get(nodeId);
+                return [node.lat, node.lng];
+            });
+
+            const polyline = L.polyline(polylineCoords, {
+                color: '#3b82f6',
+                weight: 4,
+                opacity: 0.7
+            }).addTo(map);
+            routeLayers.push(polyline);
+
+            const walkPathA = result.walk_path_a || [];
+            const walkPathB = result.walk_path_b || [];
+
+            if (walkPathA.length > 1) {
+                const walkLineA = L.polyline(
+                    walkPathA.map(p => [p.lat, p.lng]),
+                    {
+                        color: '#f97316',
+                        weight: 4,
+                        opacity: 0.9,
+                        dashArray: '8, 8'
+                    }
+                ).addTo(map);
+                routeLayers.push(walkLineA);
+            }
+
+            if (walkPathB.length > 1) {
+                const walkLineB = L.polyline(
+                    walkPathB.map(p => [p.lat, p.lng]),
+                    {
+                        color: '#f97316',
+                        weight: 4,
+                        opacity: 0.9,
+                        dashArray: '8, 8'
+                    }
+                ).addTo(map);
+                routeLayers.push(walkLineB);
+            }
+
+            const container = document.getElementById('steps-container');
+            container.innerHTML = '';
+            const validSteps = result.steps.filter(step => step.station && step.station !== 'undefined');
+            validSteps.forEach((step, idx) => {
+                const stepEl = document.createElement('div');
+                stepEl.className = 'bg-slate-50 p-2 rounded border border-slate-200 text-xs';
+                stepEl.innerHTML = `Ga ${idx + 1}: <strong>${step.station}</strong>`;
+                container.appendChild(stepEl);
+            });
+
+            document.getElementById('step-count').textContent = `${validSteps.length} ga`;
+            document.getElementById('route-results').classList.remove('hidden');
+            const boundsGroup = L.featureGroup(routeLayers);
+            map.fitBounds(boundsGroup.getBounds().pad(0.1));
+        }
+
+        function resetApp() {
+            pointA = null;
+            pointB = null;
+            if (pointAMarker) map.removeLayer(pointAMarker);
+            if (pointBMarker) map.removeLayer(pointBMarker);
+            routeLayers.forEach(layer => map.removeLayer(layer));
+            routeLayers = [];
+            document.getElementById('point-a-text').textContent = 'Click để chọn điểm A';
+            document.getElementById('point-b-text').textContent = 'Click để chọn điểm B';
+            document.getElementById('route-results').classList.add('hidden');
+        }
+
+        async function loginAdmin() {
+            const password = document.getElementById('admin-pass').value;
+            try {
+                const response = await fetch('/api/admin/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+
+                if (response.ok) {
+                    document.getElementById('admin-login-box').classList.add('hidden');
+                    document.getElementById('admin-controls').classList.remove('hidden');
+                    adminMode = 'block';
+                } else {
+                    alert('Mật khẩu sai');
+                }
+            } catch (err) {
+                alert('Lỗi đăng nhập');
+            }
+        }
+
+        function logoutAdmin() {
+            adminMode = null;
+            blockMethod = null;
+            document.getElementById('admin-login-box').classList.remove('hidden');
+            document.getElementById('admin-controls').classList.add('hidden');
+            document.getElementById('admin-pass').value = '';
+        }
+
+        function setAdminMode(mode) {
+            adminMode = mode;
+            const blockBtn = document.getElementById('btn-mode-block');
+            const unblockBtn = document.getElementById('btn-mode-unblock');
+            if (mode === 'block') {
+                blockBtn.classList.add('bg-red-600', 'text-white');
+                blockBtn.classList.remove('text-slate-400');
+                unblockBtn.classList.remove('bg-red-600', 'text-white');
+                unblockBtn.classList.add('text-slate-400');
+            } else {
+                unblockBtn.classList.add('bg-amber-600', 'text-white');
+                unblockBtn.classList.remove('text-slate-400');
+                blockBtn.classList.remove('bg-red-600', 'text-white');
+                blockBtn.classList.add('text-slate-400');
+            }
+        }
+
+        function selectBlockMethod(method) {
+            blockMethod = method;
+            zonePoints = [];
+            const helpText = document.getElementById('admin-help-text');
+            if (adminMode === 'block') {
+                if (method === 'node') helpText.textContent = '📍 Click vào 1 ga để cấm';
+                else if (method === 'edge') helpText.textContent = '🔗 Click vào 2 ga để cấm cạnh';
+                else if (method === 'zone') helpText.textContent = '🔴 Click 2 điểm: tâm + biên';
+            }
+            document.querySelectorAll('[id^="method-"]').forEach(btn => btn.classList.remove('bg-blue-200'));
+            document.getElementById(`method-${method}`).classList.add('bg-blue-200');
+        }
+
+        async function handleAdminBlockClick(lat, lng) {
+            if (blockMethod === 'node') {
+                const nearest = findNearestNode(lat, lng);
+                if (!nearest) return;
+                try {
+                    const response = await fetch('/api/admin/block-node', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ node_id: nearest.id, password: '123456' })
+                    });
+                    if (response.ok) alert(`✓ Đã cấm ga: ${nearest.id}`);
+                } catch (err) {
+                    alert('Lỗi cấm ga');
+                }
+            } else if (blockMethod === 'edge') {
+                const nearest = findNearestNode(lat, lng);
+                if (!nearest) return;
+                if (!selectedEdge) {
+                    selectedEdge = nearest;
+                    alert(`Chọn ga khác để cấm cạnh`);
+                    return;
+                }
+                try {
+                    const response = await fetch('/api/admin/block-edge', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ node1: selectedEdge.id, node2: nearest.id, password: '123456' })
+                    });
+                    if (response.ok) alert(`✓ Đã cấm cạnh`);
+                    selectedEdge = null;
+                } catch (err) {
+                    alert('Lỗi cấm cạnh');
+                    selectedEdge = null;
+                }
+            } else if (blockMethod === 'zone') {
+                zonePoints.push({ lat, lng });
+                if (zonePoints.length === 2) {
+                    const radius = Math.sqrt((zonePoints[1].lat - zonePoints[0].lat) ** 2 + 
+                                           (zonePoints[1].lng - zonePoints[0].lng) ** 2);
+                    try {
+                        await fetch('/api/admin/block-zone', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                center_lat: zonePoints[0].lat,
+                                center_lng: zonePoints[0].lng,
+                                radius: radius,
+                                password: '123456'
+                            })
+                        });
+                        alert(`✓ Đã cấm vùng`);
+                    } catch (err) {
+                        alert('Lỗi cấm vùng');
+                    }
+                    zonePoints = [];
+                }
+            }
+        }
+
+        async function handleAdminUnblockClick(lat, lng) {
+            alert('Hủy cấm: Chưa implement');
+        }
+
+        function findNearestNode(lat, lng, maxDist = 0.01) {
+            if (!window.graphData) return null;
+            let nearest = null;
+            let minDist = maxDist;
+            window.graphData.nodes.forEach(node => {
+                const dist = Math.sqrt((node.lat - lat) ** 2 + (node.lng - lng) ** 2);
+                if (dist < minDist) {
+                    minDist = dist;
+                    nearest = node;
+                }
+            });
+            return nearest;
+        }
+
+        async function resetAllForbidden() {
+            if (!confirm('Xóa tất cả cấm?')) return;
+            try {
+                await fetch('/api/admin/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: '123456' })
+                });
+                alert('✓ Đã xóa tất cả cấm');
+            } catch (err) {
+                alert('Lỗi xóa');
+            }
+        }
+
+        // Load graph on start
+        window.addEventListener('DOMContentLoaded', loadGraphData);
+    </script>
+</body>
+</html>
