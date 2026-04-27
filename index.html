@@ -63,10 +63,10 @@
             <div id="route-results" class="hidden bg-white border border-blue-200 rounded-xl overflow-hidden">
                 <div class="bg-blue-600 text-white px-4 py-3 flex justify-between">
                     <span class="text-xs font-black">Chỉ Dẫn Tuyến Đường</span>
-                    <span id="step-count" class="bg-blue-400/30 px-2 py-1 rounded text-xs font-bold">0 ga</span>
+                    <span id="step-count" class="bg-blue-400/30 px-2 py-1 rounded text-xs font-bold">0 chặng</span>
                 </div>
                 <div class="p-4 space-y-3">
-                    <div class="text-xs text-slate-600">Bạn sẽ đi qua các ga sau:</div>
+                    <div id="route-summary" class="text-xs text-slate-600">Đang tính thời gian...</div>
                     <div id="steps-container" class="space-y-2 max-h-56 overflow-y-auto custom-scrollbar"></div>
                 </div>
             </div>
@@ -137,10 +137,76 @@
                 window.graphData = data;
                 window.graphNodeMap = new Map(data.nodes.map(node => [node.id, node]));
                 console.log(`✓ Loaded ${data.nodes.length} nodes, ${data.station_nodes.length} stations, ${data.walk_nodes.length} walk points`);
+                drawForbiddenItems();
             } catch (err) {
                 console.error('Error loading graph:', err);
                 alert('Lỗi tải dữ liệu đồ thị');
             }
+        }
+
+        function clearForbiddenLayers() {
+            forbiddenMarkers.nodes.forEach(layer => map.removeLayer(layer));
+            forbiddenMarkers.edges.forEach(layer => map.removeLayer(layer));
+            forbiddenMarkers.zones.forEach(layer => map.removeLayer(layer));
+            forbiddenMarkers = { nodes: [], edges: [], zones: [] };
+        }
+
+        function drawForbiddenItems() {
+            if (!window.graphData) return;
+            clearForbiddenLayers();
+
+            const forbidden_nodes = window.graphData.forbidden_nodes || [];
+            const forbidden_edges = window.graphData.forbidden_edges || [];
+            const forbidden_zones = window.graphData.forbidden_zones || [];
+
+            // Draw forbidden nodes (gray circles)
+            forbidden_nodes.forEach(nodeId => {
+                const node = window.graphNodeMap.get(nodeId);
+                if (node) {
+                    const marker = L.circleMarker([node.lat, node.lng], {
+                        radius: 7,
+                        fillColor: '#999999',
+                        color: '#666666',
+                        weight: 2,
+                        opacity: 1,
+                        fillOpacity: 0.6,
+                        className: 'forbidden-node'
+                    }).bindPopup(`Cấm ga: ${node.name || nodeId}`).addTo(map);
+                    forbiddenMarkers.nodes.push(marker);
+                }
+            });
+
+            // Draw forbidden edges (red lines)
+            forbidden_edges.forEach(([node1, node2]) => {
+                const n1 = window.graphNodeMap.get(node1);
+                const n2 = window.graphNodeMap.get(node2);
+                if (n1 && n2) {
+                    const line = L.polyline([[n1.lat, n1.lng], [n2.lat, n2.lng]], {
+                        color: '#ef4444',
+                        weight: 4,
+                        opacity: 0.9,
+                        dashArray: '5, 5',
+                        className: 'forbidden-edge'
+                    }).bindPopup(`Cấm cạnh: ${n1.name || node1} → ${n2.name || node2}`).addTo(map);
+                    forbiddenMarkers.edges.push(line);
+                }
+            });
+
+            // Draw forbidden zones (red circle fills)
+            forbidden_zones.forEach((zone) => {
+                const circle = L.circle([zone.center_lat, zone.center_lng], {
+                    radius: zone.radius * 111000, // Convert degrees to meters
+                    color: '#ef4444',
+                    weight: 2,
+                    opacity: 0.8,
+                    fillColor: '#fca5a5',
+                    fillOpacity: 0.3,
+                    className: 'forbidden-zone'
+                }).bindPopup(`Cấm vùng: bán kính ${(zone.radius * 111).toFixed(2)} km`).addTo(map);
+                forbiddenMarkers.zones.push(circle);
+            });
+
+            console.log(`✓ Drew ${forbidden_nodes.length} forbidden nodes, ${forbidden_edges.length} edges, ${forbidden_zones.length} zones`);
         }
 
         function createAllStationPointsGeoJSON() {
@@ -309,62 +375,75 @@
             routeLayers.forEach(layer => map.removeLayer(layer));
             routeLayers = [];
 
-            const path = result.path;
-            const polylineCoords = path.map(nodeId => {
-                const node = window.graphNodeMap.get(nodeId);
-                return [node.lat, node.lng];
+            const metroSegments = result.metro_segments || [];
+            const walkSegments = result.walk_segments || [];
+
+            metroSegments.forEach(segment => {
+                if (!segment || segment.length < 2) return;
+                const line = L.polyline(segment, {
+                    color: '#2563eb',
+                    weight: 5,
+                    opacity: 0.8
+                }).addTo(map);
+                routeLayers.push(line);
             });
 
-            const polyline = L.polyline(polylineCoords, {
-                color: '#3b82f6',
-                weight: 4,
-                opacity: 0.7
-            }).addTo(map);
-            routeLayers.push(polyline);
+            walkSegments.forEach(segment => {
+                if (!segment || segment.length < 2) return;
+                const line = L.polyline(segment, {
+                    color: '#f59e0b',
+                    weight: 4,
+                    opacity: 0.95,
+                    dashArray: '8, 8'
+                }).addTo(map);
+                routeLayers.push(line);
+            });
 
-            const walkPathA = result.walk_path_a || [];
-            const walkPathB = result.walk_path_b || [];
-
-            if (walkPathA.length > 1) {
-                const walkLineA = L.polyline(
-                    walkPathA.map(p => [p.lat, p.lng]),
-                    {
-                        color: '#f97316',
+            // Backward compatibility if server returns only station path.
+            if (routeLayers.length === 0 && result.path && result.path.length > 1) {
+                const polylineCoords = result.path
+                    .map(nodeId => window.graphNodeMap.get(nodeId))
+                    .filter(Boolean)
+                    .map(node => [node.lat, node.lng]);
+                if (polylineCoords.length > 1) {
+                    const polyline = L.polyline(polylineCoords, {
+                        color: '#3b82f6',
                         weight: 4,
-                        opacity: 0.9,
-                        dashArray: '8, 8'
-                    }
-                ).addTo(map);
-                routeLayers.push(walkLineA);
-            }
-
-            if (walkPathB.length > 1) {
-                const walkLineB = L.polyline(
-                    walkPathB.map(p => [p.lat, p.lng]),
-                    {
-                        color: '#f97316',
-                        weight: 4,
-                        opacity: 0.9,
-                        dashArray: '8, 8'
-                    }
-                ).addTo(map);
-                routeLayers.push(walkLineB);
+                        opacity: 0.7
+                    }).addTo(map);
+                    routeLayers.push(polyline);
+                }
             }
 
             const container = document.getElementById('steps-container');
             container.innerHTML = '';
-            const validSteps = result.steps.filter(step => step.station && step.station !== 'undefined');
-            validSteps.forEach((step, idx) => {
+            const steps = (result.steps || []).filter(step => step && step.title);
+            steps.forEach((step, idx) => {
                 const stepEl = document.createElement('div');
                 stepEl.className = 'bg-slate-50 p-2 rounded border border-slate-200 text-xs';
-                stepEl.innerHTML = `Ga ${idx + 1}: <strong>${step.station}</strong>`;
+                const modeBadge = step.mode === 'metro'
+                    ? '<span class="inline-block px-2 py-0.5 rounded bg-blue-100 text-blue-700 font-bold mr-2">METRO</span>'
+                    : '<span class="inline-block px-2 py-0.5 rounded bg-amber-100 text-amber-700 font-bold mr-2">ĐI BỘ</span>';
+                const stationHint = (step.stations && step.stations.length)
+                    ? `<div class="text-[11px] text-slate-500 mt-1">Ga liên quan: ${step.stations.join(' → ')}</div>`
+                    : '';
+                stepEl.innerHTML = `${modeBadge}<strong>${step.title}</strong>
+                    <div class="text-[11px] text-slate-600 mt-1">Thời gian: ${Number(step.time_min || 0).toFixed(1)} phút | Quãng đường: ${Number(step.distance_m || 0).toFixed(0)} m</div>
+                    ${stationHint}`;
                 container.appendChild(stepEl);
             });
 
-            document.getElementById('step-count').textContent = `${validSteps.length} ga`;
+            const totalTime = Number(result.total_time_min || 0);
+            const totalDistance = Number(result.total_distance_m || 0);
+            document.getElementById('route-summary').textContent =
+                `Tổng thời gian dự kiến: ${totalTime.toFixed(1)} phút | Tổng quãng đường: ${totalDistance.toFixed(0)} m`;
+
+            document.getElementById('step-count').textContent = `${steps.length} chặng`;
             document.getElementById('route-results').classList.remove('hidden');
-            const boundsGroup = L.featureGroup(routeLayers);
-            map.fitBounds(boundsGroup.getBounds().pad(0.1));
+            if (routeLayers.length > 0) {
+                const boundsGroup = L.featureGroup(routeLayers);
+                map.fitBounds(boundsGroup.getBounds().pad(0.1));
+            }
         }
 
         function resetApp() {
@@ -448,7 +527,10 @@
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ node_id: nearest.id, password: '123456' })
                     });
-                    if (response.ok) alert(`✓ Đã cấm ga: ${nearest.id}`);
+                    if (response.ok) {
+                        alert(`✓ Đã cấm ga: ${nearest.id}`);
+                        loadGraphData();
+                    }
                 } catch (err) {
                     alert('Lỗi cấm ga');
                 }
@@ -466,8 +548,11 @@
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ node1: selectedEdge.id, node2: nearest.id, password: '123456' })
                     });
-                    if (response.ok) alert(`✓ Đã cấm cạnh`);
-                    selectedEdge = null;
+                    if (response.ok) {
+                        alert(`✓ Đã cấm cạnh`);
+                        selectedEdge = null;
+                        loadGraphData();
+                    }
                 } catch (err) {
                     alert('Lỗi cấm cạnh');
                     selectedEdge = null;
@@ -489,6 +574,7 @@
                             })
                         });
                         alert(`✓ Đã cấm vùng`);
+                        loadGraphData();
                     } catch (err) {
                         alert('Lỗi cấm vùng');
                     }
@@ -524,6 +610,7 @@
                     body: JSON.stringify({ password: '123456' })
                 });
                 alert('✓ Đã xóa tất cả cấm');
+                loadGraphData();
             } catch (err) {
                 alert('Lỗi xóa');
             }

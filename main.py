@@ -7,6 +7,7 @@ A* Pathfinding with Admin Blocking System
 
 import json
 import os
+import ast
 from math import sqrt, radians, sin, cos, atan2
 import heapq
 import xml.etree.ElementTree as ET
@@ -33,6 +34,7 @@ CORS(app)
 NODES_DICT = {}  # {node_id: {id, lat, lng, name, type, connections: [...]}}
 EDGES_LIST = []  # List of edges for API
 WALK_GRAPH = None
+METRO_GRAPH = None
 WALK_NODE_IDS = []
 WALK_NODE_COORDS = []
 WALK_NODES_API = []
@@ -41,7 +43,12 @@ WALK_COORD_BY_ID = {}
 STATION_TO_WALK_NODE = {}
 WALK_NODE_TO_STATIONS = {}
 METRO_COMPONENT_INDEX = {}
+COMBINED_BASE_GRAPH = None
 APP_STATE_FILE = 'graph/cache/app_state.json'
+
+WALK_SPEED_KMH = 4.8
+METRO_SPEED_KMH = 36.0
+MAX_SPEED_KMH_FOR_HEURISTIC = max(WALK_SPEED_KMH, METRO_SPEED_KMH)
 
 # ============================================================================
 # UTILITIES - HEURISTIC & DISTANCE
@@ -62,6 +69,91 @@ def haversine_distance(lat1, lng1, lat2, lng2):
     a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlng/2)**2
     c = 2 * atan2(sqrt(a), sqrt(1-a))
     return R * c
+
+
+def meters_to_minutes(distance_m, speed_kmh):
+    if speed_kmh <= 0:
+        return 0.0
+    return (distance_m / 1000.0) / speed_kmh * 60.0
+
+
+def parse_geometry_coords(value):
+    if value is None:
+        return []
+
+    parsed = value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(raw)
+            except Exception:
+                return []
+
+    if not isinstance(parsed, (list, tuple)):
+        return []
+
+    coords = []
+    for item in parsed:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            lat = float(item[0])
+            lng = float(item[1])
+        except Exception:
+            continue
+
+        if abs(lat) > 90 and abs(lng) <= 90:
+            lat, lng = lng, lat
+        if abs(lat) <= 90 and abs(lng) <= 180:
+            coords.append([lat, lng])
+
+    return coords
+
+
+def node_name(node_id, node_data):
+    if node_id == '__point_a__':
+        return 'Điểm A'
+    if node_id == '__point_b__':
+        return 'Điểm B'
+    return node_data.get('name') or node_id
+
+
+def get_edge_mode(edge_data):
+    mode = str(edge_data.get('mode', '')).lower()
+    if mode:
+        return mode
+    edge_type = str(edge_data.get('type', '')).lower()
+    if edge_type == 'metro':
+        return 'metro'
+    return 'walk'
+
+
+def edge_time_minutes(edge_data, fallback_distance_m=0.0):
+    time_val = edge_data.get('time')
+    if time_val is not None:
+        try:
+            t = float(time_val)
+            if t > 0:
+                return t
+        except Exception:
+            pass
+
+    length_val = edge_data.get('length')
+    dist_m = fallback_distance_m
+    if length_val is not None:
+        try:
+            dist_m = float(length_val)
+        except Exception:
+            pass
+
+    mode = get_edge_mode(edge_data)
+    speed = METRO_SPEED_KMH if mode == 'metro' else WALK_SPEED_KMH
+    return meters_to_minutes(max(0.0, dist_m), speed)
 
 # ============================================================================
 # A* PATHFINDING ALGORITHM
@@ -148,14 +240,83 @@ def a_star_pathfinding(start_id, end_id, nodes_dict, forbidden_nodes, forbidden_
     
     return None
 
+
+def a_star_on_graph(graph, start_id, end_id, forbidden_nodes=None, forbidden_edges=None, forbidden_zones=None):
+    """A* on a weighted multimodal graph with dynamic forbidden checking.
+    Returns (path, total_time_minutes).
+    Checks forbidden status inline - no graph copying needed.
+    """
+    if start_id not in graph or end_id not in graph:
+        return None, float('inf')
+
+    forbidden_nodes = forbidden_nodes or set()
+    forbidden_edges = forbidden_edges or set()
+    forbidden_zones = forbidden_zones or []
+
+    def is_node_forbidden(node_id):
+        if node_id in forbidden_nodes:
+            return True
+        if forbidden_zones and node_id in graph:
+            node_data = graph.nodes[node_id]
+            for zone in forbidden_zones:
+                dist = euclidean_distance(
+                    node_data['lat'], node_data['lng'],
+                    zone['center_lat'], zone['center_lng']
+                )
+                if dist <= zone['radius']:
+                    return True
+        return False
+
+    def is_edge_forbidden(u, v):
+        return (u, v) in forbidden_edges or (v, u) in forbidden_edges
+
+    def heuristic_minutes(node_id):
+        a = graph.nodes[node_id]
+        b = graph.nodes[end_id]
+        dist_km = haversine_distance(a['lat'], a['lng'], b['lat'], b['lng'])
+        return (dist_km / MAX_SPEED_KMH_FOR_HEURISTIC) * 60.0
+
+    if is_node_forbidden(start_id) or is_node_forbidden(end_id):
+        return None, float('inf')
+
+    open_set = [(heuristic_minutes(start_id), 0, start_id)]
+    came_from = {}
+    g_score = {start_id: 0.0}
+    counter = 1
+
+    while open_set:
+        _, _, current = heapq.heappop(open_set)
+        if current == end_id:
+            path = [current]
+            while current in came_from:
+                current = came_from[current]
+                path.append(current)
+            path.reverse()
+            return path, g_score[end_id]
+
+        for neighbor in graph.neighbors(current):
+            if is_node_forbidden(neighbor) or is_edge_forbidden(current, neighbor):
+                continue
+            edge_data = graph[current][neighbor]
+            tentative_g = g_score[current] + float(edge_data.get('time', 0.0))
+            if tentative_g < g_score.get(neighbor, float('inf')):
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f = tentative_g + heuristic_minutes(neighbor)
+                heapq.heappush(open_set, (f, counter, neighbor))
+                counter += 1
+
+    return None, float('inf')
+
 # ============================================================================
 # GRAPH LOADING
 # ============================================================================
 
 def load_graph_with_coordinates():
     """Load metro graph and walk graph, then link metro stations to nearest walk nodes."""
-    global NODES_DICT, EDGES_LIST, WALK_GRAPH, WALK_NODE_IDS, WALK_NODE_COORDS
+    global NODES_DICT, EDGES_LIST, WALK_GRAPH, METRO_GRAPH, WALK_NODE_IDS, WALK_NODE_COORDS
     global WALK_NODES_API, WALK_KDTREE, WALK_COORD_BY_ID, STATION_TO_WALK_NODE, WALK_NODE_TO_STATIONS, METRO_COMPONENT_INDEX
+    global COMBINED_BASE_GRAPH
 
     metro_path = 'graph/spd_metro.graphml'
     walk_path = 'graph/spd_walk.graphml'
@@ -165,6 +326,7 @@ def load_graph_with_coordinates():
 
     try:
         metro_graph = nx.read_graphml(metro_path)
+        METRO_GRAPH = metro_graph
         WALK_GRAPH = nx.read_graphml(walk_path)
         utm36_to_wgs84 = Transformer.from_crs("EPSG:32636", "EPSG:4326", always_xy=True)
 
@@ -258,6 +420,8 @@ def load_graph_with_coordinates():
             STATION_TO_WALK_NODE[station_id] = nearest_walk_id
             WALK_NODE_TO_STATIONS.setdefault(nearest_walk_id, []).append(station_id)
 
+        COMBINED_BASE_GRAPH = build_combined_base_graph()
+
         print(
             f"Loaded metro: {len(NODES_DICT)} nodes/{len(EDGES_LIST)} edges | "
             f"walk: {len(WALK_NODE_IDS)} nodes | station links: {len(STATION_TO_WALK_NODE)}"
@@ -268,24 +432,111 @@ def load_graph_with_coordinates():
         print(f"Error loading graph: {e}")
         return False
 
+
+def build_combined_base_graph():
+    """Build a base multimodal graph that includes walk + metro + station transfer edges."""
+    graph = nx.Graph()
+
+    for node_id, node_data in NODES_DICT.items():
+        graph.add_node(
+            node_id,
+            id=node_id,
+            lat=float(node_data['lat']),
+            lng=float(node_data['lng']),
+            name=node_data.get('name', node_id),
+            type=node_data.get('type', 'station')
+        )
+
+    for node_id, (lat, lng) in WALK_COORD_BY_ID.items():
+        if node_id in graph:
+            continue
+        graph.add_node(
+            node_id,
+            id=node_id,
+            lat=float(lat),
+            lng=float(lng),
+            name=f"walk_{node_id}",
+            type='walk'
+        )
+
+    if WALK_GRAPH is not None:
+        for u, v, edge_data in WALK_GRAPH.edges(data=True):
+            if u not in graph or v not in graph:
+                continue
+            a = graph.nodes[u]
+            b = graph.nodes[v]
+            fallback_len_m = haversine_distance(a['lat'], a['lng'], b['lat'], b['lng']) * 1000.0
+            time_min = edge_time_minutes({'mode': 'walk', **dict(edge_data)}, fallback_len_m)
+            length_m = float(edge_data.get('length', fallback_len_m) or fallback_len_m)
+            graph.add_edge(
+                u,
+                v,
+                mode='walk',
+                type='walk',
+                time=float(time_min),
+                length=float(length_m)
+            )
+
+    if METRO_GRAPH is not None:
+        for u, v, edge_data in METRO_GRAPH.edges(data=True):
+            if u not in graph or v not in graph:
+                continue
+            a = graph.nodes[u]
+            b = graph.nodes[v]
+            fallback_len_m = haversine_distance(a['lat'], a['lng'], b['lat'], b['lng']) * 1000.0
+            length_m = float(edge_data.get('length', fallback_len_m) or fallback_len_m)
+            time_min = edge_time_minutes({'mode': 'metro', **dict(edge_data)}, length_m)
+            geometry = parse_geometry_coords(edge_data.get('geometry_coords'))
+            graph.add_edge(
+                u,
+                v,
+                mode='metro',
+                type='metro',
+                line=edge_data.get('line', ''),
+                geometry_coords=geometry,
+                time=float(time_min),
+                length=float(length_m)
+            )
+
+    for station_id, walk_id in STATION_TO_WALK_NODE.items():
+        if station_id not in graph or walk_id not in graph:
+            continue
+        a = graph.nodes[station_id]
+        b = graph.nodes[walk_id]
+        dist_m = haversine_distance(a['lat'], a['lng'], b['lat'], b['lng']) * 1000.0
+        graph.add_edge(
+            station_id,
+            walk_id,
+            mode='walk',
+            type='walk_transfer',
+            time=meters_to_minutes(dist_m, WALK_SPEED_KMH),
+            length=dist_m
+        )
+
+    return graph
+
 # ============================================================================
 # COMPLETE ROUTING LOGIC
 # ============================================================================
 
-def find_3_nearest_station_nodes(lat, lng, n=3):
-    """Find n nearest metro station nodes to a coordinate"""
-    if not NODES_DICT:
+def find_k_nearest_walk_nodes(lat, lng, k=5):
+    """Find up to k nearest walk nodes to a coordinate."""
+    if not WALK_NODE_IDS:
         return []
-    
-    nodes_with_dist = []
-    for node_id, node in NODES_DICT.items():
-        if node.get('type') != 'station':
-            continue
-        dist = euclidean_distance(lat, lng, node['lat'], node['lng'])
-        nodes_with_dist.append((dist, node_id))
-    
-    nodes_with_dist.sort()
-    return [node_id for _, node_id in nodes_with_dist[:n]]
+
+    if WALK_KDTREE is None:
+        scored = []
+        for node_id, (n_lat, n_lng) in WALK_COORD_BY_ID.items():
+            dist_m = haversine_distance(lat, lng, n_lat, n_lng) * 1000.0
+            scored.append((dist_m, node_id))
+        scored.sort(key=lambda x: x[0])
+        return [nid for _, nid in scored[:k]]
+
+    kk = min(k, len(WALK_NODE_IDS))
+    dists, indices = WALK_KDTREE.query((lng, lat), k=kk)
+    if kk == 1:
+        indices = [indices]
+    return [WALK_NODE_IDS[int(i)] for i in indices]
 
 
 def find_nearest_walk_node(lat, lng):
@@ -304,205 +555,191 @@ def find_nearest_walk_node(lat, lng):
     return WALK_NODE_IDS[best_idx]
 
 
-def dijkstra_to_nearest_station_walk_node(source_walk_node, station_walk_nodes):
-    """Run Dijkstra on walk graph from source to the nearest station-linked walk node."""
-    if WALK_GRAPH is None or source_walk_node is None or not station_walk_nodes:
-        return None, float('inf'), []
-
-    dist = {source_walk_node: 0.0}
-    parent = {}
-    visited = set()
-    heap = [(0.0, source_walk_node)]
-
-    while heap:
-        cur_dist, cur = heapq.heappop(heap)
-        if cur in visited:
-            continue
-        visited.add(cur)
-
-        if cur in station_walk_nodes:
-            path = [cur]
-            while cur in parent:
-                cur = parent[cur]
-                path.append(cur)
-            path.reverse()
-            return path[-1], cur_dist, path
-
-        for _, nxt, edge_data in WALK_GRAPH.out_edges(cur, data=True):
-            weight = float(edge_data.get('time') or edge_data.get('length') or 1.0)
-            nd = cur_dist + weight
-            if nd < dist.get(nxt, float('inf')):
-                dist[nxt] = nd
-                parent[nxt] = cur
-                heapq.heappush(heap, (nd, nxt))
-
-    return None, float('inf'), []
-
-
-def dijkstra_to_k_station_walk_nodes(source_walk_node, station_walk_nodes, k=6):
-    """Run Dijkstra on walk graph and return up to k nearest station-linked walk nodes."""
-    if WALK_GRAPH is None or source_walk_node is None or not station_walk_nodes:
+def orient_edge_coords(coords, start_lat, start_lng):
+    """Orient polyline to start near the given start coordinate."""
+    if not coords:
         return []
-
-    dist = {source_walk_node: 0.0}
-    parent = {}
-    visited = set()
-    heap = [(0.0, source_walk_node)]
-    found = []
-
-    while heap and len(found) < k:
-        cur_dist, cur = heapq.heappop(heap)
-        if cur in visited:
-            continue
-        visited.add(cur)
-
-        if cur in station_walk_nodes:
-            path = [cur]
-            p = cur
-            while p in parent:
-                p = parent[p]
-                path.append(p)
-            path.reverse()
-            found.append((cur, cur_dist, path))
-
-        for _, nxt, edge_data in WALK_GRAPH.out_edges(cur, data=True):
-            weight = float(edge_data.get('time') or edge_data.get('length') or 1.0)
-            nd = cur_dist + weight
-            if nd < dist.get(nxt, float('inf')):
-                dist[nxt] = nd
-                parent[nxt] = cur
-                heapq.heappush(heap, (nd, nxt))
-
-    return found
-
-
-def pick_station_from_walk_node(walk_node_id, point_lat, point_lng):
-    """Pick the most suitable metro station mapped to a walk node."""
-    station_ids = WALK_NODE_TO_STATIONS.get(walk_node_id, [])
-    if not station_ids:
-        return None
-    return min(
-        station_ids,
-        key=lambda sid: euclidean_distance(point_lat, point_lng, NODES_DICT[sid]['lat'], NODES_DICT[sid]['lng'])
-    )
-
-
-def walk_path_to_coords(walk_path):
-    """Convert walk-node path to coordinate list for frontend rendering."""
-    coords = []
-    for node_id in walk_path:
-        pos = WALK_COORD_BY_ID.get(node_id)
-        if pos is None:
-            continue
-        coords.append({'lat': pos[0], 'lng': pos[1]})
+    first = coords[0]
+    last = coords[-1]
+    d_first = (first[0] - start_lat) ** 2 + (first[1] - start_lng) ** 2
+    d_last = (last[0] - start_lat) ** 2 + (last[1] - start_lng) ** 2
+    if d_last < d_first:
+        return list(reversed(coords))
     return coords
 
-def find_complete_path(point_a, point_b, forbidden_nodes, forbidden_edges, forbidden_zones):
-    """
-    Find complete path from point A to point B
-    Flow: A → nearest station → traverse metro → nearest station to B → B
-    """
-    source_walk_a = find_nearest_walk_node(point_a['lat'], point_a['lng'])
-    source_walk_b = find_nearest_walk_node(point_b['lat'], point_b['lng'])
-    station_walk_nodes = set(WALK_NODE_TO_STATIONS.keys())
 
-    best_result = None
-    best_walk_total = float('inf')
-    best_metro_cost = float('inf')
+def build_route_segments(graph, path):
+    """Convert node path into grouped walk/metro segments with geometry and timing."""
+    segments = []
+    if not path or len(path) < 2:
+        return segments
 
-    # Expand search radius progressively to avoid false no-path when nearest stations
-    # belong to disconnected metro components.
-    for k in (8, 20, 60):
-        start_candidates = dijkstra_to_k_station_walk_nodes(source_walk_a, station_walk_nodes, k=k)
-        end_candidates = dijkstra_to_k_station_walk_nodes(source_walk_b, station_walk_nodes, k=k)
-        if not start_candidates or not end_candidates:
+    current = None
+
+    for u, v in zip(path[:-1], path[1:]):
+        edge_data = graph[u][v]
+        mode = get_edge_mode(edge_data)
+        u_node = graph.nodes[u]
+        v_node = graph.nodes[v]
+
+        coords = edge_data.get('geometry_coords')
+        if not coords:
+            coords = [[u_node['lat'], u_node['lng']], [v_node['lat'], v_node['lng']]
+            ]
+        coords = orient_edge_coords(coords, u_node['lat'], u_node['lng'])
+
+        edge_time = float(edge_data.get('time', 0.0))
+        edge_len = float(edge_data.get('length', 0.0))
+
+        if current is None or current['mode'] != mode:
+            current = {
+                'mode': mode,
+                'from_id': u,
+                'to_id': v,
+                'from_name': node_name(u, u_node),
+                'to_name': node_name(v, v_node),
+                'node_ids': [u, v],
+                'coords': list(coords),
+                'time_min': edge_time,
+                'distance_m': edge_len,
+            }
+            segments.append(current)
             continue
 
-        start_station_candidates = []
-        for start_walk_station_node, walk_cost_a, walk_path_a in start_candidates:
-            start_station = pick_station_from_walk_node(start_walk_station_node, point_a['lat'], point_a['lng'])
-            if start_station is None or start_station in forbidden_nodes:
-                continue
-            start_station_candidates.append((start_station, walk_cost_a, walk_path_a))
+        current['to_id'] = v
+        current['to_name'] = node_name(v, v_node)
+        current['node_ids'].append(v)
+        current['time_min'] += edge_time
+        current['distance_m'] += edge_len
+        if current['coords'] and coords:
+            if current['coords'][-1] == coords[0]:
+                current['coords'].extend(coords[1:])
+            else:
+                current['coords'].extend(coords)
 
-        end_station_candidates = []
-        for end_walk_station_node, walk_cost_b, walk_path_b in end_candidates:
-            end_station = pick_station_from_walk_node(end_walk_station_node, point_b['lat'], point_b['lng'])
-            if end_station is None or end_station in forbidden_nodes:
-                continue
-            end_station_candidates.append((end_station, walk_cost_b, walk_path_b))
+    return segments
 
-        if not start_station_candidates or not end_station_candidates:
-            continue
 
-        # Only evaluate pairs in the same connected component of metro graph.
-        has_component_overlap = False
-        for start_station, walk_cost_a, walk_path_a in start_station_candidates:
-            start_comp = METRO_COMPONENT_INDEX.get(start_station)
-            if start_comp is None:
-                continue
-            for end_station, walk_cost_b, walk_path_b in end_station_candidates:
-                if METRO_COMPONENT_INDEX.get(end_station) != start_comp:
-                    continue
-                has_component_overlap = True
-
-                metro_path = a_star_pathfinding(
-                    start_station,
-                    end_station,
-                    NODES_DICT,
-                    forbidden_nodes,
-                    forbidden_edges,
-                    forbidden_zones
-                )
-                if not metro_path:
-                    continue
-
-                metro_cost = 0.0
-                for i in range(len(metro_path) - 1):
-                    curr = NODES_DICT[metro_path[i]]
-                    nxt = NODES_DICT[metro_path[i + 1]]
-                    metro_cost += euclidean_distance(curr['lat'], curr['lng'], nxt['lat'], nxt['lng'])
-
-                walk_total = walk_cost_a + walk_cost_b
-                # Prioritize nearest access stations by walking distance first,
-                # then use metro distance as a tie-breaker.
-                if (walk_total < best_walk_total) or (
-                    walk_total == best_walk_total and metro_cost < best_metro_cost
-                ):
-                    best_walk_total = walk_total
-                    best_metro_cost = metro_cost
-                    best_result = {
-                        'start_station': start_station,
-                        'end_station': end_station,
-                        'metro_path': metro_path,
-                        'walk_cost_a': walk_cost_a,
-                        'walk_cost_b': walk_cost_b,
-                        'walk_path_a_coords': walk_path_to_coords(walk_path_a),
-                        'walk_path_b_coords': walk_path_to_coords(walk_path_b),
-                        'total_cost': walk_total + metro_cost
-                    }
-
-        if best_result is not None:
-            return best_result
-        if has_component_overlap:
-            break
-
-    return best_result
-
-def generate_steps(complete_path_result, point_a, point_b):
-    """Generate a simplified station-only route sequence"""
-    if not complete_path_result:
-        return []
-    
-    seen = set()
+def build_detailed_steps(graph, segments):
     steps = []
-    metro_path = complete_path_result['metro_path']
-    for node_id in metro_path:
-        station_name = NODES_DICT[node_id]['name']
-        if station_name not in seen:
-            seen.add(station_name)
-            steps.append({'station': station_name})
+    for idx, seg in enumerate(segments, start=1):
+        station_names = [
+            node_name(node_id, graph.nodes[node_id])
+            for node_id in seg['node_ids']
+            if graph.nodes[node_id].get('type') == 'station'
+        ]
+        station_names = list(dict.fromkeys(station_names))
+
+        if seg['mode'] == 'metro':
+            title = f"Chặng {idx}: Đi metro từ {seg['from_name']} đến {seg['to_name']}"
+        else:
+            title = f"Chặng {idx}: Đi bộ từ {seg['from_name']} đến {seg['to_name']}"
+
+        steps.append({
+            'mode': seg['mode'],
+            'title': title,
+            'from': seg['from_name'],
+            'to': seg['to_name'],
+            'time_min': round(seg['time_min'], 2),
+            'distance_m': round(seg['distance_m'], 1),
+            'stations': station_names
+        })
     return steps
+
+
+def find_complete_path(point_a, point_b, forbidden_nodes, forbidden_edges, forbidden_zones):
+    """Run unified A* from A to B on the combined walk+metro graph.
+    Now passes forbidden items as dynamic parameters instead of copying graph.
+    """
+    if COMBINED_BASE_GRAPH is None:
+        return None
+
+    # Check if start/end points are in forbidden zones
+    for zone in forbidden_zones:
+        dist_a = euclidean_distance(
+            point_a['lat'], point_a['lng'],
+            zone['center_lat'], zone['center_lng']
+        )
+        if dist_a <= zone['radius']:
+            return None
+        dist_b = euclidean_distance(
+            point_b['lat'], point_b['lng'],
+            zone['center_lat'], zone['center_lng']
+        )
+        if dist_b <= zone['radius']:
+            return None
+
+    # Create temporary graph with virtual A/B points
+    graph = COMBINED_BASE_GRAPH.copy()
+    graph.add_node('__point_a__', id='__point_a__', lat=point_a['lat'], lng=point_a['lng'], name='Điểm A', type='point')
+    graph.add_node('__point_b__', id='__point_b__', lat=point_b['lat'], lng=point_b['lng'], name='Điểm B', type='point')
+
+    nearest_a = find_k_nearest_walk_nodes(point_a['lat'], point_a['lng'], k=6)
+    nearest_b = find_k_nearest_walk_nodes(point_b['lat'], point_b['lng'], k=6)
+    if not nearest_a or not nearest_b:
+        return None
+
+    for walk_id in nearest_a:
+        if walk_id not in graph:
+            continue
+        walk_node = graph.nodes[walk_id]
+        dist_m = haversine_distance(point_a['lat'], point_a['lng'], walk_node['lat'], walk_node['lng']) * 1000.0
+        graph.add_edge(
+            '__point_a__',
+            walk_id,
+            mode='walk',
+            type='walk_access',
+            time=meters_to_minutes(dist_m, WALK_SPEED_KMH),
+            length=dist_m,
+            geometry_coords=[[point_a['lat'], point_a['lng']], [walk_node['lat'], walk_node['lng']]]
+        )
+
+    for walk_id in nearest_b:
+        if walk_id not in graph:
+            continue
+        walk_node = graph.nodes[walk_id]
+        dist_m = haversine_distance(point_b['lat'], point_b['lng'], walk_node['lat'], walk_node['lng']) * 1000.0
+        graph.add_edge(
+            '__point_b__',
+            walk_id,
+            mode='walk',
+            type='walk_access',
+            time=meters_to_minutes(dist_m, WALK_SPEED_KMH),
+            length=dist_m,
+            geometry_coords=[[point_b['lat'], point_b['lng']], [walk_node['lat'], walk_node['lng']]]
+        )
+
+    # Pass forbidden items as parameters - A* checks inline
+    path, total_time = a_star_on_graph(
+        graph, '__point_a__', '__point_b__',
+        forbidden_nodes=forbidden_nodes,
+        forbidden_edges=forbidden_edges,
+        forbidden_zones=forbidden_zones
+    )
+    if not path:
+        return None
+
+    segments = build_route_segments(graph, path)
+    steps = build_detailed_steps(graph, segments)
+
+    walk_segments = [seg['coords'] for seg in segments if seg['mode'] != 'metro']
+    metro_segments = [seg['coords'] for seg in segments if seg['mode'] == 'metro']
+    station_path = [
+        node_id for node_id in path
+        if node_id in NODES_DICT and NODES_DICT[node_id].get('type') == 'station'
+    ]
+    total_distance = sum(seg['distance_m'] for seg in segments)
+
+    return {
+        'path_nodes': path,
+        'station_path': station_path,
+        'segments': segments,
+        'walk_segments': walk_segments,
+        'metro_segments': metro_segments,
+        'steps': steps,
+        'total_time_min': round(total_time, 2),
+        'total_distance_m': round(total_distance, 1)
+    }
 
 # ============================================================================
 # STATE MANAGEMENT
@@ -656,16 +893,16 @@ def find_path():
         if not result:
             return jsonify({'error': 'No path found'}), 404
         
-        # Build response
-        path = result['metro_path']
-        steps = generate_steps(result, point_a, point_b)
-        
         return jsonify({
-            'path': path,
-            'steps': steps,
-            'distance': len(path),
-            'walk_path_a': result.get('walk_path_a_coords', []),
-            'walk_path_b': result.get('walk_path_b_coords', [])
+            'path': result.get('station_path', []),
+            'path_nodes': result.get('path_nodes', []),
+            'steps': result.get('steps', []),
+            'segments': result.get('segments', []),
+            'walk_segments': result.get('walk_segments', []),
+            'metro_segments': result.get('metro_segments', []),
+            'total_time_min': result.get('total_time_min', 0.0),
+            'total_distance_m': result.get('total_distance_m', 0.0),
+            'distance': len(result.get('path_nodes', []))
         }), 200
     
     except Exception as e:
