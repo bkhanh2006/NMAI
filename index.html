@@ -88,7 +88,13 @@
                 </div>
                 <div class="bg-white p-1 rounded-lg border border-slate-200 flex gap-1">
                     <button id="btn-mode-block" onclick="setAdminMode('block')" class="flex-1 py-2 text-xs font-black rounded bg-red-600 text-white">CẤM</button>
-                    <button id="btn-mode-unblock" onclick="setAdminMode('unblock')" class="flex-1 py-2 text-xs font-black rounded text-slate-400">HỦY</button>
+                    <button id="btn-mode-unblock" onclick="setAdminMode('unblock')" class="flex-1 py-2 text-xs font-black rounded border border-green-200 bg-green-50 text-green-600">HỦY</button>
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                    <button onclick="resetForbiddenNodes()" class="py-2 text-xs font-black rounded border border-rose-200 bg-rose-50 text-rose-700">Xóa tất cả điểm cấm</button>
+                    <button onclick="resetForbiddenEdges()" class="py-2 text-xs font-black rounded border border-orange-200 bg-orange-50 text-orange-700">Xóa tất cả cạnh cấm</button>
+                    <button onclick="resetForbiddenZones()" class="py-2 text-xs font-black rounded border border-amber-200 bg-amber-50 text-amber-700">Xóa tất cả vùng cấm</button>
+                    <button onclick="resetAllForbidden()" class="py-2 text-xs font-black rounded border border-slate-300 bg-slate-50 text-slate-700">Xóa hết mọi lệnh cấm</button>
                 </div>
                 <div class="space-y-1">
                     <button onclick="selectBlockMethod('node')" id="method-node" class="w-full py-2 text-xs font-bold rounded bg-slate-100 hover:bg-blue-100">📍 Cấm Ga</button>
@@ -96,7 +102,6 @@
                     <button onclick="selectBlockMethod('zone')" id="method-zone" class="w-full py-2 text-xs font-bold rounded bg-slate-100 hover:bg-blue-100">🔴 Cấm Vùng</button>
                 </div>
                 <div id="admin-help-text" class="bg-blue-50 p-2 rounded text-xs text-blue-700 text-center font-medium">Chọn phương thức cấm</div>
-                <button onclick="resetAllForbidden()" class="w-full py-2 text-xs font-black text-slate-500 hover:text-red-600">🔄 Xóa Tất Cả</button>
             </div>
         </div>
     </aside>
@@ -123,19 +128,32 @@
         let stationLayerVisible = false;
         let walkLayerVisible = false;
         let forbiddenMarkers = { nodes: [], edges: [], zones: [] };
+        let zoneSelectionMarkers = [];
         
         let adminMode = null;
         let blockMethod = null;
         let selectedEdge = null;
+        let selectedEdgeMarker = null;
         let zonePoints = [];
+        let zonePreviewMarkers = [];
+
+        function edgeKey(node1, node2) {
+            return [String(node1), String(node2)].sort().join('__');
+        }
 
         // Load graph data
         async function loadGraphData() {
             try {
+                routeLayers.forEach(layer => map.removeLayer(layer));
+                routeLayers = [];
                 const response = await fetch('/api/graph-data');
                 const data = await response.json();
                 window.graphData = data;
                 window.graphNodeMap = new Map(data.nodes.map(node => [node.id, node]));
+                window.graphEdgeMap = new Map();
+                (data.edges || []).forEach(edge => {
+                    window.graphEdgeMap.set(edgeKey(edge.from, edge.to), edge);
+                });
                 console.log(`✓ Loaded ${data.nodes.length} nodes, ${data.station_nodes.length} stations, ${data.walk_nodes.length} walk points`);
                 drawForbiddenItems();
             } catch (err) {
@@ -157,53 +175,127 @@
 
             const forbidden_nodes = window.graphData.forbidden_nodes || [];
             const forbidden_edges = window.graphData.forbidden_edges || [];
+            const forbidden_edge_routes = window.graphData.forbidden_edge_routes || [];
             const forbidden_zones = window.graphData.forbidden_zones || [];
 
-            // Draw forbidden nodes (gray circles)
+            // Draw forbidden nodes (red circles)
             forbidden_nodes.forEach(nodeId => {
                 const node = window.graphNodeMap.get(nodeId);
                 if (node) {
                     const marker = L.circleMarker([node.lat, node.lng], {
                         radius: 7,
-                        fillColor: '#999999',
-                        color: '#666666',
+                        fillColor: '#ef4444',
+                        color: '#dc2626',
                         weight: 2,
                         opacity: 1,
-                        fillOpacity: 0.6,
-                        className: 'forbidden-node'
-                    }).bindPopup(`Cấm ga: ${node.name || nodeId}`).addTo(map);
+                        fillOpacity: 0.8,
+                        className: 'forbidden-node',
+                        interactiveForUnblock: true
+                    }).addTo(map);
+                    marker.nodeId = nodeId; // Store nodeId for unblock functionality
                     forbiddenMarkers.nodes.push(marker);
                 }
             });
 
-            // Draw forbidden edges (red lines)
-            forbidden_edges.forEach(([node1, node2]) => {
-                const n1 = window.graphNodeMap.get(node1);
-                const n2 = window.graphNodeMap.get(node2);
-                if (n1 && n2) {
-                    const line = L.polyline([[n1.lat, n1.lng], [n2.lat, n2.lng]], {
+            // Draw forbidden edges using full metro routes when available
+            if (forbidden_edge_routes.length > 0) {
+                forbidden_edge_routes.forEach(route => {
+                    const polylineCoords = (route.geometry_coords || [])
+                        .map(coord => {
+                            if (Array.isArray(coord) && coord.length >= 2) {
+                                return [coord[0], coord[1]];
+                            }
+                            if (coord && coord.lat !== undefined && coord.lng !== undefined) {
+                                return [coord.lat, coord.lng];
+                            }
+                            return null;
+                        })
+                        .filter(coord => coord !== null);
+
+                    if (polylineCoords.length < 2) {
+                        return;
+                    }
+
+                    const line = L.polyline(polylineCoords, {
                         color: '#ef4444',
                         weight: 4,
                         opacity: 0.9,
                         dashArray: '5, 5',
-                        className: 'forbidden-edge'
-                    }).bindPopup(`Cấm cạnh: ${n1.name || node1} → ${n2.name || node2}`).addTo(map);
+                        className: 'forbidden-edge',
+                        interactiveForUnblock: true
+                    }).addTo(map);
+                    line.routeStart = route.start;
+                    line.routeEnd = route.end;
+                    line.routePath = route.path || [];
                     forbiddenMarkers.edges.push(line);
-                }
-            });
+                });
+            } else {
+                forbidden_edges.forEach(([node1, node2]) => {
+                    const n1 = window.graphNodeMap.get(node1);
+                    const n2 = window.graphNodeMap.get(node2);
+                    if (n1 && n2) {
+                        const edgeKey = [String(node1), String(node2)].sort().join('__');
+                        const edge = window.graphEdgeMap.get(edgeKey);
+                        let polylineCoords = [[n1.lat, n1.lng], [n2.lat, n2.lng]];
+                        
+                        if (edge && edge.geometry_coords && Array.isArray(edge.geometry_coords) && edge.geometry_coords.length > 2) {
+                            polylineCoords = edge.geometry_coords.map(coord => {
+                                if (coord && coord.lat !== undefined && coord.lng !== undefined) {
+                                    return [coord.lat, coord.lng];
+                                }
+                                return null;
+                            }).filter(coord => coord !== null);
+                            
+                            if (polylineCoords.length < 2) {
+                                polylineCoords = [[n1.lat, n1.lng], [n2.lat, n2.lng]];
+                            }
+                        }
+                        
+                        const line = L.polyline(polylineCoords, {
+                            color: '#ef4444',
+                            weight: 4,
+                            opacity: 0.9,
+                            dashArray: '5, 5',
+                            className: 'forbidden-edge',
+                            interactiveForUnblock: true
+                        }).addTo(map);
+                        line.node1 = node1;
+                        line.node2 = node2;
+                        forbiddenMarkers.edges.push(line);
+                    }
+                });
+            }
 
-            // Draw forbidden zones (red circle fills)
-            forbidden_zones.forEach((zone) => {
-                const circle = L.circle([zone.center_lat, zone.center_lng], {
-                    radius: zone.radius * 111000, // Convert degrees to meters
+            // Draw forbidden zones with center and boundary markers
+            forbidden_zones.forEach((zone, zoneIndex) => {
+                const center = [zone.center_lat, zone.center_lng];
+    
+                // Prefer explicit meter radius if backend provided it
+                const radiusMeters = (zone.radius_m !== undefined) ? zone.radius_m : (zone.radius * 111000);
+                const circle = L.circle(center, {
+                    radius: radiusMeters,
                     color: '#ef4444',
                     weight: 2,
                     opacity: 0.8,
                     fillColor: '#fca5a5',
                     fillOpacity: 0.3,
                     className: 'forbidden-zone'
-                }).bindPopup(`Cấm vùng: bán kính ${(zone.radius * 111).toFixed(2)} km`).addTo(map);
+                }).addTo(map);
                 forbiddenMarkers.zones.push(circle);
+                const centerMarker = L.circleMarker(center, {
+                    radius: 6,
+                    fillColor: '#ef4444',
+                    color: '#991b1b',
+                    weight: 2,
+                    opacity: 1,
+                    fillOpacity: 0.95,
+                    interactiveForUnblock: true
+                }).addTo(map);
+                centerMarker.zoneIndex = zoneIndex;
+                centerMarker.isZoneCenter = true;
+                centerMarker.zoneData = zone;
+                forbiddenMarkers.zones.push(centerMarker);
+    
             });
 
             console.log(`✓ Drew ${forbidden_nodes.length} forbidden nodes, ${forbidden_edges.length} edges, ${forbidden_zones.length} zones`);
@@ -307,7 +399,7 @@
                 handleAdminBlockClick(lat, lng);
                 return;
             }
-
+            
             if (adminMode === 'unblock' && blockMethod) {
                 handleAdminUnblockClick(lat, lng);
                 return;
@@ -482,36 +574,83 @@
         function logoutAdmin() {
             adminMode = null;
             blockMethod = null;
+            selectedEdge = null;
+            if (selectedEdgeMarker) {
+                map.removeLayer(selectedEdgeMarker);
+                selectedEdgeMarker = null;
+            }
+            zonePoints = [];
+            clearZoneSelectionPreview();
             document.getElementById('admin-login-box').classList.remove('hidden');
             document.getElementById('admin-controls').classList.add('hidden');
             document.getElementById('admin-pass').value = '';
         }
 
+        function clearAdminSelectionState() {
+            selectedEdge = null;
+            zonePoints = [];
+            clearZoneSelectionPreview();
+            if (selectedEdgeMarker) {
+                map.removeLayer(selectedEdgeMarker);
+                selectedEdgeMarker = null;
+            }
+        }
+
         function setAdminMode(mode) {
             adminMode = mode;
+            blockMethod = null;
+            selectedEdge = null;
+            selectedEdgeMarker = null;
+            zonePoints = [];
+            clearZoneSelectionPreview();
+            
             const blockBtn = document.getElementById('btn-mode-block');
             const unblockBtn = document.getElementById('btn-mode-unblock');
+            const methodButtons = document.querySelectorAll('[id^="method-"]');
+            
             if (mode === 'block') {
                 blockBtn.classList.add('bg-red-600', 'text-white');
-                blockBtn.classList.remove('text-slate-400');
-                unblockBtn.classList.remove('bg-red-600', 'text-white');
-                unblockBtn.classList.add('text-slate-400');
-            } else {
-                unblockBtn.classList.add('bg-amber-600', 'text-white');
-                unblockBtn.classList.remove('text-slate-400');
+                blockBtn.classList.remove('border-red-200', 'bg-red-50', 'text-red-600');
+                unblockBtn.classList.add('border-green-200', 'bg-green-50', 'text-green-600');
+                unblockBtn.classList.remove('bg-green-600', 'text-white');
+                methodButtons.forEach(btn => btn.classList.remove('hidden'));
+                document.getElementById('admin-help-text').textContent = 'Chọn phương thức cấm';
+            } else if (mode === 'unblock') {
+                blockBtn.classList.add('border-red-200', 'bg-red-50', 'text-red-600');
                 blockBtn.classList.remove('bg-red-600', 'text-white');
-                blockBtn.classList.add('text-slate-400');
+                unblockBtn.classList.add('bg-green-600', 'text-white');
+                unblockBtn.classList.remove('border-green-200', 'bg-green-50', 'text-green-600');
+                methodButtons.forEach(btn => btn.classList.remove('hidden'));
+                document.getElementById('admin-help-text').textContent = 'Chọn phương thức hủy cấm';
             }
+        }
+
+        function clearZoneSelectionPreview() {
+            zoneSelectionMarkers.forEach(marker => map.removeLayer(marker));
+            zoneSelectionMarkers = [];
+            zonePreviewMarkers.forEach(marker => map.removeLayer(marker));
+            zonePreviewMarkers = [];
         }
 
         function selectBlockMethod(method) {
             blockMethod = method;
+            selectedEdge = null;
+            if (selectedEdgeMarker) {
+                map.removeLayer(selectedEdgeMarker);
+                selectedEdgeMarker = null;
+            }
             zonePoints = [];
+            clearZoneSelectionPreview();
             const helpText = document.getElementById('admin-help-text');
+            
             if (adminMode === 'block') {
                 if (method === 'node') helpText.textContent = '📍 Click vào 1 ga để cấm';
                 else if (method === 'edge') helpText.textContent = '🔗 Click vào 2 ga để cấm cạnh';
-                else if (method === 'zone') helpText.textContent = '🔴 Click 2 điểm: tâm + biên';
+                else if (method === 'zone') helpText.textContent = '🔴 Click 2 điểm: tâm + biên (sẽ vẽ ngay)';
+            } else if (adminMode === 'unblock') {
+                if (method === 'node') helpText.textContent = '📍 Click vào ga cấm để hủy';
+                else if (method === 'edge') helpText.textContent = '🔗 Click 2 ga cấm để hủy cạnh';
+                else if (method === 'zone') helpText.textContent = '🔴 Click tâm + biên vùng cấm để hủy';
             }
             document.querySelectorAll('[id^="method-"]').forEach(btn => btn.classList.remove('bg-blue-200'));
             document.getElementById(`method-${method}`).classList.add('bg-blue-200');
@@ -522,46 +661,105 @@
                 const nearest = findNearestNode(lat, lng);
                 if (!nearest) return;
                 try {
-                    const response = await fetch('/api/admin/block-node', {
+                    await fetch('/api/admin/block-node', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ node_id: nearest.id, password: '123456' })
                     });
-                    if (response.ok) {
-                        alert(`✓ Đã cấm ga: ${nearest.id}`);
-                        loadGraphData();
-                    }
+                    loadGraphData();
                 } catch (err) {
-                    alert('Lỗi cấm ga');
+                    console.error('Lỗi cấm ga', err);
                 }
             } else if (blockMethod === 'edge') {
-                const nearest = findNearestNode(lat, lng);
+                const nearest = findNearestStation(lat, lng);
                 if (!nearest) return;
                 if (!selectedEdge) {
                     selectedEdge = nearest;
-                    alert(`Chọn ga khác để cấm cạnh`);
+                    // Show visual feedback - highlight selected station
+                    if (selectedEdgeMarker) map.removeLayer(selectedEdgeMarker);
+                    selectedEdgeMarker = L.circleMarker([nearest.lat, nearest.lng], {
+                        radius: 10,
+                        fillColor: '#fbbf24',
+                        color: '#f59e0b',
+                        weight: 3,
+                        opacity: 1,
+                        fillOpacity: 0.7
+                    }).addTo(map);
+                    const helpText = document.getElementById('admin-help-text');
+                    helpText.textContent = `🔗 Đã chọn: ${nearest.id}, Click ga thứ 2`;
                     return;
                 }
                 try {
-                    const response = await fetch('/api/admin/block-edge', {
+                    await fetch('/api/admin/block-edge', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ node1: selectedEdge.id, node2: nearest.id, password: '123456' })
                     });
-                    if (response.ok) {
-                        alert(`✓ Đã cấm cạnh`);
-                        selectedEdge = null;
-                        loadGraphData();
-                    }
-                } catch (err) {
-                    alert('Lỗi cấm cạnh');
                     selectedEdge = null;
+                    if (selectedEdgeMarker) map.removeLayer(selectedEdgeMarker);
+                    selectedEdgeMarker = null;
+                    loadGraphData();
+                } catch (err) {
+                    console.error('Lỗi cấm cạnh', err);
+                    selectedEdge = null;
+                    if (selectedEdgeMarker) map.removeLayer(selectedEdgeMarker);
+                    selectedEdgeMarker = null;
                 }
             } else if (blockMethod === 'zone') {
                 zonePoints.push({ lat, lng });
-                if (zonePoints.length === 2) {
+                
+                if (zonePoints.length === 1) {
+                    // First click - show preview circle and center marker
+                    clearZoneSelectionPreview();
+                    const center = [zonePoints[0].lat, zonePoints[0].lng];
+                    
+                    // Add center marker
+                    const centerMarker = L.circleMarker(center, {
+                        radius: 7,
+                        fillColor: '#fbbf24',
+                        color: '#f59e0b',
+                        weight: 2,
+                        opacity: 1,
+                        fillOpacity: 0.8
+                    }).addTo(map);
+                    zonePreviewMarkers.push(centerMarker);
+                    
+                    const helpText = document.getElementById('admin-help-text');
+                    helpText.textContent = '🔴 Tâm đã chọn, Click điểm biên';
+                } else if (zonePoints.length === 2) {
+                    // Second click - calculate radius and update preview
                     const radius = Math.sqrt((zonePoints[1].lat - zonePoints[0].lat) ** 2 + 
                                            (zonePoints[1].lng - zonePoints[0].lng) ** 2);
+                    
+                    // Clear old preview
+                    zonePreviewMarkers.forEach(marker => map.removeLayer(marker));
+                    zonePreviewMarkers = [];
+                    
+                    // Draw final circle
+                    const circlePreview = L.circle([zonePoints[0].lat, zonePoints[0].lng], {
+                        radius: radius * 111000,
+                        color: '#fbbf24',
+                        weight: 2,
+                        opacity: 0.8,
+                        fillColor: '#fef3c7',
+                        fillOpacity: 0.3
+                    }).addTo(map);
+                    zonePreviewMarkers.push(circlePreview);
+                    
+                    // Draw center and boundary markers
+                    const centerMarker = L.circleMarker([zonePoints[0].lat, zonePoints[0].lng], {
+                        radius: 6,
+                        fillColor: '#fbbf24',
+                        color: '#b45309',
+                        weight: 2,
+                        opacity: 1,
+                        fillOpacity: 0.9
+                    }).addTo(map);
+                    zonePreviewMarkers.push(centerMarker);
+                    
+                    // No boundary marker: show only circle from center to radius
+                    
+                    // Submit the block
                     try {
                         await fetch('/api/admin/block-zone', {
                             method: 'POST',
@@ -570,21 +768,132 @@
                                 center_lat: zonePoints[0].lat,
                                 center_lng: zonePoints[0].lng,
                                 radius: radius,
+                                boundary_lat: zonePoints[1].lat,
+                                boundary_lng: zonePoints[1].lng,
                                 password: '123456'
                             })
                         });
-                        alert(`✓ Đã cấm vùng`);
                         loadGraphData();
                     } catch (err) {
-                        alert('Lỗi cấm vùng');
+                        console.error('Lỗi cấm vùng', err);
                     }
                     zonePoints = [];
+                    clearZoneSelectionPreview();
                 }
             }
         }
 
         async function handleAdminUnblockClick(lat, lng) {
-            alert('Hủy cấm: Chưa implement');
+            if (blockMethod === 'node') {
+                // Find forbidden node to unblock
+                const forbidden_nodes = window.graphData.forbidden_nodes || [];
+                let targetNode = null;
+                let minDist = 0.001; // Small threshold for clicking on node
+                
+                forbidden_nodes.forEach(nodeId => {
+                    const node = window.graphNodeMap.get(nodeId);
+                    if (node) {
+                        const dist = Math.sqrt((node.lat - lat) ** 2 + (node.lng - lng) ** 2);
+                        if (dist < minDist) {
+                            minDist = dist;
+                            targetNode = { id: nodeId, node };
+                        }
+                    }
+                });
+                
+                if (!targetNode) return;
+                
+                try {
+                    await fetch('/api/admin/unblock-node', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ node_id: targetNode.id, password: '123456' })
+                    });
+                    loadGraphData();
+                } catch (err) {
+                    console.error('Lỗi hủy cấm ga', err);
+                }
+            } else if (blockMethod === 'edge') {
+                // Click directly on a forbidden metro route to unblock the full path
+                const forbidden_edge_routes = window.graphData.forbidden_edge_routes || [];
+                let targetRoute = null;
+                let minDist = 0.002;
+
+                forbidden_edge_routes.forEach(route => {
+                    const coords = route.geometry_coords || [];
+                    for (let i = 0; i < coords.length - 1; i++) {
+                        const current = coords[i];
+                        const next = coords[i + 1];
+                        const currLat = Array.isArray(current) ? current[0] : current.lat;
+                        const currLng = Array.isArray(current) ? current[1] : current.lng;
+                        const nextLat = Array.isArray(next) ? next[0] : next.lat;
+                        const nextLng = Array.isArray(next) ? next[1] : next.lng;
+                        const dist = pointToLineDistance(lat, lng, currLat, currLng, nextLat, nextLng);
+                        if (dist < minDist) {
+                            minDist = dist;
+                            targetRoute = route;
+                        }
+                    }
+                });
+
+                if (!targetRoute) return;
+
+                try {
+                    await fetch('/api/admin/unblock-edge', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ node1: targetRoute.start, node2: targetRoute.end, password: '123456' })
+                    });
+                    loadGraphData();
+                } catch (err) {
+                    console.error('Lỗi hủy cấm cạnh', err);
+                }
+            } else if (blockMethod === 'zone') {
+                // Click directly on forbidden zone to unblock it
+                const forbidden_zones = window.graphData.forbidden_zones || [];
+                let targetZone = null;
+                let minDist = Infinity;
+                
+                forbidden_zones.forEach((zone) => {
+                    const center = [zone.center_lat, zone.center_lng];
+                    // Calculate distance to circle center
+                    const dist = Math.sqrt((zone.center_lat - lat) ** 2 + (zone.center_lng - lng) ** 2);
+                    const radiusInDegrees = zone.radius;
+                    
+                    // Check if click is inside or near the circle
+                    if (dist <= radiusInDegrees * 1.2 && dist < minDist) {
+                        minDist = dist;
+                        targetZone = zone;
+                    }
+                });
+                
+                if (!targetZone) return;
+                
+                try {
+                    await fetch('/api/admin/unblock-zone', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            center_lat: targetZone.center_lat,
+                            center_lng: targetZone.center_lng,
+                            radius: targetZone.radius,
+                            password: '123456'
+                        })
+                    });
+                    loadGraphData();
+                } catch (err) {
+                    console.error('Lỗi hủy cấm vùng', err);
+                }
+            }
+        }
+
+        function pointToLineDistance(px, py, x1, y1, x2, y2) {
+            const dx = x2 - x1;
+            const dy = y2 - y1;
+            const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)));
+            const nearX = x1 + t * dx;
+            const nearY = y1 + t * dy;
+            return Math.sqrt((px - nearX) ** 2 + (py - nearY) ** 2);
         }
 
         function findNearestNode(lat, lng, maxDist = 0.01) {
@@ -601,18 +910,72 @@
             return nearest;
         }
 
+        function findNearestStation(lat, lng, maxDist = 0.01) {
+            if (!window.graphData) return null;
+            let nearest = null;
+            let minDist = maxDist;
+            (window.graphData.station_nodes || []).forEach(node => {
+                const dist = Math.sqrt((node.lat - lat) ** 2 + (node.lng - lng) ** 2);
+                if (dist < minDist) {
+                    minDist = dist;
+                    nearest = node;
+                }
+            });
+            return nearest;
+        }
+
         async function resetAllForbidden() {
-            if (!confirm('Xóa tất cả cấm?')) return;
             try {
                 await fetch('/api/admin/reset', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: '123456' })
+                    body: JSON.stringify({ password: '123456', scope: 'all' })
                 });
-                alert('✓ Đã xóa tất cả cấm');
+                clearAdminSelectionState();
                 loadGraphData();
             } catch (err) {
-                alert('Lỗi xóa');
+                console.error('Lỗi xóa', err);
+            }
+        }
+
+        async function resetForbiddenNodes() {
+            try {
+                await fetch('/api/admin/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: '123456', scope: 'nodes' })
+                });
+                loadGraphData();
+            } catch (err) {
+                console.error('Lỗi xóa điểm cấm', err);
+            }
+        }
+
+        async function resetForbiddenEdges() {
+            try {
+                await fetch('/api/admin/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: '123456', scope: 'edges' })
+                });
+                clearAdminSelectionState();
+                loadGraphData();
+            } catch (err) {
+                console.error('Lỗi xóa cạnh cấm', err);
+            }
+        }
+
+        async function resetForbiddenZones() {
+            try {
+                await fetch('/api/admin/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: '123456', scope: 'zones' })
+                });
+                clearAdminSelectionState();
+                loadGraphData();
+            } catch (err) {
+                console.error('Lỗi xóa vùng cấm', err);
             }
         }
 

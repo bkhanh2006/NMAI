@@ -1,138 +1,190 @@
+import os
 import json
+import itertools
+import osmnx as ox
 import networkx as nx
 import pandas as pd
-import geopandas as gpd
-import osmnx as ox
-
-from shapely.geometry import LineString, MultiLineString
-from shapely.ops import linemerge, substring
-# Sử dụng union_all thay vì unary_union theo khuyến cáo mới
-try:
-    from shapely.ops import union_all
-except ImportError:
-    from shapely.ops import unary_union as union_all
-
+from shapely.ops import substring, linemerge
 from pyproj import Transformer
+from shapely.geometry import LineString, Point
 
 # ============================================================
-# 1. CẤU HÌNH (LỌC TRIỆT ĐỂ)
+# 1. CẤU HÌNH
 # ============================================================
 PLACE_NAME = "Saint Petersburg, Russia"
-OUT_METRO = r"C:\Users\LENOVO\Documents\GitHub\NMAI\graph\spd_metro.graphml"
-
-CRS_WGS84 = "EPSG:4326"
 CRS_METERS = "EPSG:32636"
+CRS_WGS84 = "EPSG:4326"
+OUT_METRO = os.path.join("graph", "spd_metro.graphml")
 
-# Khoảng cách bắt ray và chuyển tuyến
-MAX_DIST_TO_LINE = 500 
-TRANSFER_DIST = 200 
-TRAIN_SPEED = 1000
+TRAIN_SPEED = 1000  # Vận tốc tàu (m/phút)
+WALK_SPEED = 60     # Vận tốc đi bộ trung chuyển (m/phút)
 
 ox.settings.use_cache = True
-
-# ============================================================
-# 2. HÀM HỖ TRỢ
-# ============================================================
 to_wgs84 = Transformer.from_crs(CRS_METERS, CRS_WGS84, always_xy=True)
 
-def edge_geom_to_json(line):
-    coords = [[to_wgs84.transform(x, y)[1], to_wgs84.transform(x, y)[0]] for x, y in line.coords]
-    return json.dumps(coords)
+BANNED_STATIONS = ["Броневая"]
+
+def edge_to_leaflet_coords(segment):
+    if segment.geom_type == 'MultiLineString':
+        segment = linemerge(segment)
+        if segment.geom_type == 'MultiLineString':
+            segment = max(segment.geoms, key=lambda x: x.length)
+    return json.dumps([[to_wgs84.transform(x, y)[1], to_wgs84.transform(x, y)[0]] for x, y in segment.coords])
 
 # ============================================================
-# 3. LẤY & LỌC DATA (CHỈ LẤY METRO THỰC SỰ)
+# 2. LẤY & LỌC DỮ LIỆU
 # ============================================================
-print("--- Đang tải dữ liệu Metro (Đã lọc ga tàu hỏa) ---")
+print("--- Đang tải dữ liệu Metro ---")
+stations = ox.features_from_place(PLACE_NAME, tags={"station": "subway"}).to_crs(CRS_METERS)
+tracks = ox.features_from_place(PLACE_NAME, tags={"railway": "subway"}).to_crs(CRS_METERS)
 
-# CHỈ lấy những gì là SUBWAY
-tags_st = {"station": "subway", "subway": "yes"}
-gdf_st = ox.features_from_place(PLACE_NAME, tags=tags_st)
+inactive_tags = ['construction', 'proposed', 'planned', 'under_construction', 'disused', 'abandoned']
+if 'status' in stations.columns:
+    stations = stations[~stations['status'].isin(inactive_tags)]
+if 'status' in tracks.columns:
+    tracks = tracks[~tracks['status'].isin(inactive_tags)]
 
-# Lọc bỏ các ga entrance (lối vào) và platform rác
-mask = (gdf_st["station"] == "subway") | (gdf_st["subway"] == "yes")
-gdf_st = gdf_st[mask].copy()
+# Lọc chặn các đường ray kỹ thuật, nhánh phụ
+if 'service' in tracks.columns:
+    tracks = tracks[tracks['service'].isnull() | (tracks['service'] == 'no')]
+if 'usage' in tracks.columns:
+    tracks = tracks[tracks['usage'].isnull() | (tracks['usage'] == 'main')]
 
-gdf_st["geometry"] = gdf_st.geometry.centroid
-gdf_st_m = gdf_st.to_crs(CRS_METERS)
-gdf_st_m["final_name"] = gdf_st_m["name:en"].fillna(gdf_st_m["name"])
+tracks = tracks[tracks.geometry.type.isin(["LineString", "MultiLineString"])]
 
-# Gom ga theo tên (Mỗi ga 1 điểm duy nhất)
-stations_data = []
-for name, group in gdf_st_m.groupby("final_name"):
-    if pd.isna(name): continue
-    stations_data.append({
-        "sid": f"st_{len(stations_data)}",
-        "name": str(name),
-        "geom": union_all(list(group.geometry)).centroid
-    })
-df_final_st = gpd.GeoDataFrame(stations_data, geometry="geom", crs=CRS_METERS)
+print("--- Đang xử lý hình học (Merge Tracks) ---")
+merged_tracks = linemerge(tracks.geometry.tolist())
+lines = list(merged_tracks.geoms) if merged_tracks.geom_type == 'MultiLineString' else [merged_tracks]
 
 # ============================================================
-# 4. XÂY DỰNG ĐỒ THỊ
+# 3. XỬ LÝ GA (NODES)
 # ============================================================
-G = nx.Graph(crs=CRS_WGS84)
-for _, row in df_final_st.iterrows():
-    p = to_wgs84.transform(row.geom.x, row.geom.y)
-    G.add_node(row["sid"], lat=p[1], lng=p[0], name=row["name"], type="station")
+stations['final_name'] = stations['name:en'].fillna(stations.get('name', 'Unknown'))
 
-# NỐI CẠNH THEO ĐƯỜNG RAY
+pattern = '|'.join(BANNED_STATIONS)
+stations = stations[~stations['final_name'].str.contains(pattern, case=False, na=False)]
+
+st_nodes = stations.groupby('final_name')['geometry'].apply(lambda g: g.union_all().centroid).reset_index()
+
+G = nx.Graph(crs=CRS_WGS84) 
+for idx, row in st_nodes.iterrows():
+    lng, lat = to_wgs84.transform(row.geometry.x, row.geometry.y)
+    G.add_node(str(idx), name=str(row['final_name']), lat=lat, lng=lng, x=lng, y=lat)
+
+# ============================================================
+# 4. XỬ LÝ TUYẾN (EDGES) - [CHỐNG RẼ NHÁNH TẠI TRẠM TRUNG CHUYỂN]
+# ============================================================
 print("--- Đang kết nối mạng lưới ---")
-lines = ox.features_from_place(PLACE_NAME, tags={"railway": "subway"})
-lines = lines[lines.geometry.geom_type.isin(["LineString", "MultiLineString"])].to_crs(CRS_METERS)
-
-# Dán tất cả các mẩu ray rời rạc lại thành các đường dài nhất có thể
-unified_rail = union_all(list(lines.geometry))
-merged_rail = linemerge(unified_rail)
-
-# Chuyển về list các đoạn để xử lý
-if isinstance(merged_rail, LineString):
-    segments = [merged_rail]
-elif isinstance(merged_rail, MultiLineString):
-    segments = list(merged_rail.geoms)
-else:
-    segments = []
-
-for rail in segments:
-    near = []
-    for _, st in df_final_st.iterrows():
-        d = st.geom.distance(rail)
-        if d <= MAX_DIST_TO_LINE:
-            near.append((rail.project(st.geom), st["sid"]))
+for line in lines:
+    near_st = []
+    for idx, row in st_nodes.iterrows():
+        dist = line.distance(row.geometry)
+        if dist < 250: # Tăng tầm nhìn tìm ga lân cận
+            near_st.append({
+                'id': str(idx),
+                'pos': line.project(row.geometry),
+                'dist': dist
+            })
     
-    near.sort(key=lambda x: x[0])
-    # Loại bỏ ga lặp lại trong chuỗi
-    seq = [near[i] for i in range(len(near)) if i == 0 or near[i][1] != near[i-1][1]]
+    if len(near_st) < 2: 
+        continue
+        
+    near_st.sort(key=lambda x: x['pos'])
     
-    for (p1, u), (p2, v) in zip(seq[:-1], seq[1:]):
-        if u != v:
-            seg = substring(rail, p1, p2)
-            if seg.length > 10:
-                # Nếu đã có cạnh, chỉ cập nhật nếu cạnh mới ngắn hơn
-                if G.has_edge(u, v):
-                    if seg.length < G[u][v]['length']:
-                        G[u][v].update({"length": round(seg.length, 2), "geometry_coords": edge_geom_to_json(seg)})
-                else:
-                    G.add_edge(u, v, length=round(seg.length, 2), 
-                               geometry_coords=edge_geom_to_json(seg), type="metro")
-
-# NỐI CẠNH TRUNG CHUYỂN (Chống ga cô lập)
-for i, st1 in df_final_st.iterrows():
-    for j, st2 in df_final_st.iterrows():
-        if i >= j: continue
-        dist = st1.geom.distance(st2.geom)
-        if dist <= TRANSFER_DIST:
-            if not G.has_edge(st1["sid"], st2["sid"]):
-                line = LineString([st1.geom, st2.geom])
-                G.add_edge(st1["sid"], st2["sid"], length=round(dist, 2),
-                           geometry_coords=edge_geom_to_json(line), type="transfer")
+    filtered_st = []
+    current_group = [near_st[0]]
+    
+    # [FIX CỐT LÕI]: Tăng kích thước bao phủ của 1 cụm lên 350m
+    for i in range(1, len(near_st)):
+        if near_st[i]['pos'] - current_group[0]['pos'] < 350:
+            current_group.append(near_st[i])
+        else:
+            best_st = min(current_group, key=lambda x: x['dist'])
+            filtered_st.append(best_st)
+            current_group = [near_st[i]]
+            
+    if current_group:
+        best_st = min(current_group, key=lambda x: x['dist'])
+        filtered_st.append(best_st)
+            
+    for i in range(len(filtered_st) - 1):
+        u, v = filtered_st[i]['id'], filtered_st[i+1]['id']
+        start_pos, end_pos = filtered_st[i]['pos'], filtered_st[i+1]['pos']
+        
+        if u != v and not G.has_edge(u, v):
+            segment = substring(line, start_pos, end_pos)
+            
+            coords = list(segment.coords)
+            u_geom = st_nodes.loc[int(u), 'geometry']
+            v_geom = st_nodes.loc[int(v), 'geometry']
+            
+            # Ép nét vẽ dính chặt vào nút đại diện
+            if Point(coords[0]).distance(u_geom) < Point(coords[-1]).distance(u_geom):
+                coords.insert(0, (u_geom.x, u_geom.y))
+                coords.append((v_geom.x, v_geom.y))
+            else:
+                coords.insert(0, (v_geom.x, v_geom.y))
+                coords.append((u_geom.x, u_geom.y))
+                
+            visual_segment = LineString(coords)
+            length = round(segment.length, 2)
+            
+            G.add_edge(
+                u, v, length=length, time=round(length / TRAIN_SPEED, 2), speed=TRAIN_SPEED,
+                transfer=False, geometry_coords=edge_to_leaflet_coords(visual_segment)
+            )
 
 # ============================================================
-# 5. XUẤT FILE & KIỂM TRA
+# 5. LIÊN THÔNG GA ĐI BỘ (TRANSFER EDGES)
 # ============================================================
+for u, v in itertools.combinations(G.nodes, 2):
+    if not G.has_edge(u, v):
+        u_idx, v_idx = int(u), int(v)
+        dist = st_nodes.loc[u_idx, 'geometry'].distance(st_nodes.loc[v_idx, 'geometry'])
+        
+        if dist < 300: 
+            length = round(dist, 2)
+            transfer_line = LineString([st_nodes.loc[u_idx, 'geometry'], st_nodes.loc[v_idx, 'geometry']])
+            G.add_edge(
+                u, v, length=length, time=round(length / WALK_SPEED, 2), speed=WALK_SPEED,
+                transfer=True, geometry_coords=edge_to_leaflet_coords(transfer_line)
+            )
+
+# ============================================================
+# 6. AUTO-FIX (BẢO HIỂM CHO A*)
+# ============================================================
+components = list(nx.connected_components(G))
+if len(components) > 1:
+    print(f"[*] CẢNH BÁO: Đang vá lỗi liên thông cho {len(components)} cụm...")
+    components.sort(key=len, reverse=True)
+    main_comp = components[0]
+    
+    for i in range(1, len(components)):
+        small_comp = components[i]
+        min_dist = float('inf')
+        best_pair = None
+        
+        for u in small_comp:
+            for v in main_comp:
+                dist = st_nodes.loc[int(u), 'geometry'].distance(st_nodes.loc[int(v), 'geometry'])
+                if dist < min_dist:
+                    min_dist = dist
+                    best_pair = (u, v)
+                    
+        if best_pair:
+            u, v = best_pair
+            length = round(min_dist, 2)
+            fix_line = LineString([st_nodes.loc[int(u), 'geometry'], st_nodes.loc[int(v), 'geometry']])
+            G.add_edge(
+                u, v, length=length, time=round(length / TRAIN_SPEED, 2), speed=TRAIN_SPEED,
+                transfer=True, geometry_coords=edge_to_leaflet_coords(fix_line), note="auto_fixed"
+            )
+            main_comp.update(small_comp)
+
+# ============================================================
+# 7. XUẤT FILE
+# ============================================================
+os.makedirs("graph", exist_ok=True)
 nx.write_graphml(G, OUT_METRO)
-isolates = list(nx.isolates(G))
-print(f"\nKẾT QUẢ FINAL: {G.number_of_nodes()} ga, {G.number_of_edges()} cạnh.")
-if isolates:
-    print(f"Danh sách {len(isolates)} ga vẫn cô lập: {[G.nodes[n]['name'] for n in isolates]}")
-else:
-    print("Tuyệt vời! Toàn bộ các ga đã được kết nối thông suốt.")
+
+print(f"Hoàn tất! Đồ thị liên thông vững chắc gồm {G.number_of_nodes()} ga và {G.number_of_edges()} cạnh.")

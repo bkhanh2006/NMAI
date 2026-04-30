@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Smart Map Pro - St. Petersburg Metro Route Optimizer
-A* Pathfinding with Admin Blocking System
+A* Pathfinding with Admin Blocking System (Optimized Version)
 """
 
 import json
@@ -10,10 +10,6 @@ import os
 import ast
 from math import sqrt, radians, sin, cos, atan2
 import heapq
-import xml.etree.ElementTree as ET
-from datetime import datetime
-from pathlib import Path
-
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import networkx as nx
@@ -24,15 +20,14 @@ except Exception:
     cKDTree = None
 
 # ============================================================================
-# INITIALIZATION
+# INITIALIZATION & GLOBALS
 # ============================================================================
 
 app = Flask(__name__)
 CORS(app)
 
-# Global variables
-NODES_DICT = {}  # {node_id: {id, lat, lng, name, type, connections: [...]}}
-EDGES_LIST = []  # List of edges for API
+NODES_DICT = {}  
+EDGES_LIST = []  
 WALK_GRAPH = None
 METRO_GRAPH = None
 WALK_NODE_IDS = []
@@ -41,28 +36,30 @@ WALK_NODES_API = []
 WALK_KDTREE = None
 WALK_COORD_BY_ID = {}
 STATION_TO_WALK_NODE = {}
-WALK_NODE_TO_STATIONS = {}
-METRO_COMPONENT_INDEX = {}
 COMBINED_BASE_GRAPH = None
-APP_STATE_FILE = 'graph/cache/app_state.json'
 
 WALK_SPEED_KMH = 4.8
 METRO_SPEED_KMH = 36.0
 MAX_SPEED_KMH_FOR_HEURISTIC = max(WALK_SPEED_KMH, METRO_SPEED_KMH)
+ST_PETERSBURG_BBOX = {
+    'min_lat': 59.5000,
+    'max_lat': 60.3000,
+    'min_lng': 29.4000,
+    'max_lng': 31.0000
+}
 
 # ============================================================================
 # UTILITIES - HEURISTIC & DISTANCE
 # ============================================================================
 
-def euclidean_distance(lat1, lng1, lat2, lng2):
-    """Calculate Euclidean distance between two coordinates (in degrees)"""
-    dlat = lat2 - lat1
-    dlng = lng2 - lng1
-    return sqrt(dlat * dlat + dlng * dlng)
+def is_in_st_petersburg(lat, lng):
+    """Kiểm tra xem tọa độ có nằm trong giới hạn St. Petersburg không"""
+    return (ST_PETERSBURG_BBOX['min_lat'] <= float(lat) <= ST_PETERSBURG_BBOX['max_lat']) and \
+           (ST_PETERSBURG_BBOX['min_lng'] <= float(lng) <= ST_PETERSBURG_BBOX['max_lng'])
 
 def haversine_distance(lat1, lng1, lat2, lng2):
-    """Calculate haversine distance in km"""
-    R = 6371  # Earth radius in km
+    """Tính khoảng cách Haversine chuẩn (km) cho tọa độ cầu"""
+    R = 6371.0 
     lat1, lng1, lat2, lng2 = map(radians, [lat1, lng1, lat2, lng2])
     dlat = lat2 - lat1
     dlng = lng2 - lng1
@@ -70,675 +67,314 @@ def haversine_distance(lat1, lng1, lat2, lng2):
     c = 2 * atan2(sqrt(a), sqrt(1-a))
     return R * c
 
-
 def meters_to_minutes(distance_m, speed_kmh):
-    if speed_kmh <= 0:
-        return 0.0
+    if speed_kmh <= 0: return 0.0
     return (distance_m / 1000.0) / speed_kmh * 60.0
 
-
 def parse_geometry_coords(value):
-    if value is None:
-        return []
-
+    if not value: return []
     parsed = value
     if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return []
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            try:
-                parsed = ast.literal_eval(raw)
-            except Exception:
-                return []
-
-    if not isinstance(parsed, (list, tuple)):
-        return []
-
+        try: parsed = ast.literal_eval(value.strip())
+        except Exception: return []
+    if not isinstance(parsed, (list, tuple)): return []
+    
     coords = []
     for item in parsed:
-        if not isinstance(item, (list, tuple)) or len(item) < 2:
-            continue
-        try:
-            lat = float(item[0])
-            lng = float(item[1])
-        except Exception:
-            continue
-
-        if abs(lat) > 90 and abs(lng) <= 90:
-            lat, lng = lng, lat
-        if abs(lat) <= 90 and abs(lng) <= 180:
-            coords.append([lat, lng])
-
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            lat, lng = float(item[0]), float(item[1])
+            if abs(lat) > 90 and abs(lng) <= 90: lat, lng = lng, lat
+            if abs(lat) <= 90 and abs(lng) <= 180: coords.append([lat, lng])
     return coords
 
+def edge_intersects_forbidden_zone(graph, u, v, forbidden_zones):
+    """Tối ưu hóa: Thuật toán chiếu điểm lên đoạn thẳng để tìm khoảng cách ngắn nhất đến tâm vùng cấm"""
+    if not forbidden_zones: return False
+
+    # Lấy tọa độ của cạnh
+    if hasattr(graph, 'nodes') and u in graph and v in graph[u]:
+        coords = graph[u][v].get('geometry_coords') or [[graph.nodes[u]['lat'], graph.nodes[u]['lng']], [graph.nodes[v]['lat'], graph.nodes[v]['lng']]]
+    else:
+        coords = [[graph[u]['lat'], graph[u]['lng']], [graph[v]['lat'], graph[v]['lng']]]
+    
+    if len(coords) < 2: return False
+
+    R = 6371000.0 
+    deg2rad = 3.141592653589793 / 180.0
+
+    for zone in forbidden_zones:
+        center_lat, center_lng = zone['center_lat'], zone['center_lng']
+        radius_m = float(zone.get('radius_m', zone.get('radius', 0.0) * 111000.0))
+        cos_lat = cos(radians(center_lat))
+
+        for (start_lat, start_lng), (end_lat, end_lng) in zip(coords[:-1], coords[1:]):
+            # Quy đổi hệ tọa độ x,y theo mét so với tâm
+            x1 = (start_lng - center_lng) * deg2rad * R * cos_lat
+            y1 = (start_lat - center_lat) * deg2rad * R
+            x2 = (end_lng - center_lng) * deg2rad * R * cos_lat
+            y2 = (end_lat - center_lat) * deg2rad * R
+
+            dx, dy = x2 - x1, y2 - y1
+            denom = dx * dx + dy * dy
+            
+            if denom == 0: dist_m = sqrt(x1 * x1 + y1 * y1)
+            else:
+                t = max(0.0, min(1.0, -(x1 * dx + y1 * dy) / denom))
+                near_x, near_y = x1 + t * dx, y1 + t * dy
+                dist_m = sqrt(near_x * near_x + near_y * near_y)
+
+            if dist_m <= radius_m: return True
+    return False
 
 def node_name(node_id, node_data):
-    if node_id == '__point_a__':
-        return 'Điểm A'
-    if node_id == '__point_b__':
-        return 'Điểm B'
+    if node_id in ('__point_a__', '__point_b__'): return 'Điểm A' if node_id == '__point_a__' else 'Điểm B'
     return node_data.get('name') or node_id
 
-
 def get_edge_mode(edge_data):
-    mode = str(edge_data.get('mode', '')).lower()
-    if mode:
-        return mode
-    edge_type = str(edge_data.get('type', '')).lower()
-    if edge_type == 'metro':
-        return 'metro'
-    return 'walk'
-
-
-def edge_time_minutes(edge_data, fallback_distance_m=0.0):
-    time_val = edge_data.get('time')
-    if time_val is not None:
-        try:
-            t = float(time_val)
-            if t > 0:
-                return t
-        except Exception:
-            pass
-
-    length_val = edge_data.get('length')
-    dist_m = fallback_distance_m
-    if length_val is not None:
-        try:
-            dist_m = float(length_val)
-        except Exception:
-            pass
-
-    mode = get_edge_mode(edge_data)
-    speed = METRO_SPEED_KMH if mode == 'metro' else WALK_SPEED_KMH
-    return meters_to_minutes(max(0.0, dist_m), speed)
+    return str(edge_data.get('mode', edge_data.get('type', 'walk'))).lower()
 
 # ============================================================================
 # A* PATHFINDING ALGORITHM
 # ============================================================================
 
-def a_star_pathfinding(start_id, end_id, nodes_dict, forbidden_nodes, forbidden_edges, forbidden_zones):
-    """
-    A* pathfinding algorithm
-    Returns path as list of node IDs, or None if no path exists
-    """
-    if start_id not in nodes_dict or end_id not in nodes_dict:
-        return None
-    
-    start_node = nodes_dict[start_id]
-    end_node = nodes_dict[end_id]
-    
-    # Priority queue: (f_score, counter, node_id)
-    open_set = [(0, 0, start_id)]
-    came_from = {}
-    g_score = {start_id: 0}
-    h_score = euclidean_distance(start_node['lat'], start_node['lng'],
-                                  end_node['lat'], end_node['lng'])
-    f_score = {start_id: h_score}
-    counter = 1
-    
-    while open_set:
-        current_f, _, current_id = heapq.heappop(open_set)
-        
-        if current_id == end_id:
-            # Reconstruct path
-            path = [current_id]
-            while current_id in came_from:
-                current_id = came_from[current_id]
-                path.append(current_id)
-            return path[::-1]
-        
-        current_node = nodes_dict[current_id]
-        
-        # Check if node is forbidden
-        if current_id in forbidden_nodes:
-            continue
-        
-        # Check if in forbidden zone
-        in_forbidden_zone = False
-        for zone in forbidden_zones:
-            dist_to_zone = euclidean_distance(
-                current_node['lat'], current_node['lng'],
-                zone['center_lat'], zone['center_lng']
-            )
-            if dist_to_zone <= zone['radius']:
-                in_forbidden_zone = True
-                break
-        if in_forbidden_zone:
-            continue
-        
-        # Explore neighbors
-        for neighbor_id in current_node['connections']:
-            if neighbor_id in forbidden_nodes:
-                continue
-            
-            # Check if edge is forbidden
-            if (current_id, neighbor_id) in forbidden_edges or \
-               (neighbor_id, current_id) in forbidden_edges:
-                continue
-            
-            neighbor_node = nodes_dict[neighbor_id]
-            
-            # Cost = Euclidean distance (metro travel)
-            edge_cost = euclidean_distance(
-                current_node['lat'], current_node['lng'],
-                neighbor_node['lat'], neighbor_node['lng']
-            )
-            
-            tentative_g = g_score[current_id] + edge_cost
-            
-            if neighbor_id not in g_score or tentative_g < g_score[neighbor_id]:
-                came_from[neighbor_id] = current_id
-                g_score[neighbor_id] = tentative_g
-                h = euclidean_distance(neighbor_node['lat'], neighbor_node['lng'],
-                                      end_node['lat'], end_node['lng'])
-                f_score[neighbor_id] = tentative_g + h
-                heapq.heappush(open_set, (f_score[neighbor_id], counter, neighbor_id))
-                counter += 1
-    
-    return None
-
-
 def a_star_on_graph(graph, start_id, end_id, forbidden_nodes=None, forbidden_edges=None, forbidden_zones=None):
-    """A* on a weighted multimodal graph with dynamic forbidden checking.
-    Returns (path, total_time_minutes).
-    Checks forbidden status inline - no graph copying needed.
-    """
-    if start_id not in graph or end_id not in graph:
-        return None, float('inf')
+    """Hàm A* duy nhất dùng cho cả đi bộ và metro, xử lý cấm đường trực tiếp"""
+    if start_id not in graph or end_id not in graph: return None, float('inf')
 
     forbidden_nodes = forbidden_nodes or set()
     forbidden_edges = forbidden_edges or set()
     forbidden_zones = forbidden_zones or []
 
-    def is_node_forbidden(node_id):
-        if node_id in forbidden_nodes:
-            return True
-        if forbidden_zones and node_id in graph:
-            node_data = graph.nodes[node_id]
-            for zone in forbidden_zones:
-                dist = euclidean_distance(
-                    node_data['lat'], node_data['lng'],
-                    zone['center_lat'], zone['center_lng']
-                )
-                if dist <= zone['radius']:
+    def is_node_forbidden(n_id):
+        if n_id in forbidden_nodes: return True
+        if forbidden_zones and n_id in graph:
+            n_data = graph.nodes[n_id]
+            for z in forbidden_zones:
+                if haversine_distance(n_data['lat'], n_data['lng'], z['center_lat'], z['center_lng']) * 1000.0 <= float(z.get('radius_m', 0)):
                     return True
         return False
 
     def is_edge_forbidden(u, v):
-        return (u, v) in forbidden_edges or (v, u) in forbidden_edges
+        if (u, v) in forbidden_edges or (v, u) in forbidden_edges: return True
+        return edge_intersects_forbidden_zone(graph, u, v, forbidden_zones)
 
-    def heuristic_minutes(node_id):
-        a = graph.nodes[node_id]
-        b = graph.nodes[end_id]
-        dist_km = haversine_distance(a['lat'], a['lng'], b['lat'], b['lng'])
+    if is_node_forbidden(start_id) or is_node_forbidden(end_id): return None, float('inf')
+
+    end_lat, end_lng = graph.nodes[end_id]['lat'], graph.nodes[end_id]['lng']
+    def heuristic_min(n_id):
+        dist_km = haversine_distance(graph.nodes[n_id]['lat'], graph.nodes[n_id]['lng'], end_lat, end_lng)
         return (dist_km / MAX_SPEED_KMH_FOR_HEURISTIC) * 60.0
 
-    if is_node_forbidden(start_id) or is_node_forbidden(end_id):
-        return None, float('inf')
-
-    open_set = [(heuristic_minutes(start_id), 0, start_id)]
-    came_from = {}
-    g_score = {start_id: 0.0}
+    open_set = [(heuristic_min(start_id), 0, start_id)]
+    came_from, g_score = {}, {start_id: 0.0}
     counter = 1
 
     while open_set:
         _, _, current = heapq.heappop(open_set)
         if current == end_id:
-            path = [current]
+            path = []
             while current in came_from:
-                current = came_from[current]
                 path.append(current)
-            path.reverse()
-            return path, g_score[end_id]
+                current = came_from[current]
+            path.append(start_id)
+            return path[::-1], g_score[end_id]
 
         for neighbor in graph.neighbors(current):
-            if is_node_forbidden(neighbor) or is_edge_forbidden(current, neighbor):
-                continue
-            edge_data = graph[current][neighbor]
-            tentative_g = g_score[current] + float(edge_data.get('time', 0.0))
+            if is_node_forbidden(neighbor) or is_edge_forbidden(current, neighbor): continue
+            
+            edge_time = float(graph[current][neighbor].get('time', 0.0))
+            tentative_g = g_score[current] + edge_time
+            
             if tentative_g < g_score.get(neighbor, float('inf')):
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_g
-                f = tentative_g + heuristic_minutes(neighbor)
-                heapq.heappush(open_set, (f, counter, neighbor))
+                heapq.heappush(open_set, (tentative_g + heuristic_min(neighbor), counter, neighbor))
                 counter += 1
 
     return None, float('inf')
 
 # ============================================================================
-# GRAPH LOADING
+# GRAPH LOADING & ROUTE BUILDING
 # ============================================================================
 
 def load_graph_with_coordinates():
-    """Load metro graph and walk graph, then link metro stations to nearest walk nodes."""
     global NODES_DICT, EDGES_LIST, WALK_GRAPH, METRO_GRAPH, WALK_NODE_IDS, WALK_NODE_COORDS
-    global WALK_NODES_API, WALK_KDTREE, WALK_COORD_BY_ID, STATION_TO_WALK_NODE, WALK_NODE_TO_STATIONS, METRO_COMPONENT_INDEX
-    global COMBINED_BASE_GRAPH
+    global WALK_NODES_API, WALK_KDTREE, WALK_COORD_BY_ID, STATION_TO_WALK_NODE, COMBINED_BASE_GRAPH
 
-    metro_path = 'graph/spd_metro.graphml'
-    walk_path = 'graph/spd_walk.graphml'
-    if not os.path.exists(metro_path) or not os.path.exists(walk_path):
-        print(f"Error: missing graph files. metro={os.path.exists(metro_path)} walk={os.path.exists(walk_path)}")
-        return False
+    metro_path, walk_path = 'graph/spd_metro.graphml', 'graph/spd_walk.graphml'
+    if not os.path.exists(metro_path) or not os.path.exists(walk_path): return False
 
-    try:
-        metro_graph = nx.read_graphml(metro_path)
-        METRO_GRAPH = metro_graph
-        WALK_GRAPH = nx.read_graphml(walk_path)
-        utm36_to_wgs84 = Transformer.from_crs("EPSG:32636", "EPSG:4326", always_xy=True)
+    METRO_GRAPH = nx.read_graphml(metro_path)
+    WALK_GRAPH = nx.read_graphml(walk_path)
+    utm36_to_wgs84 = Transformer.from_crs("EPSG:32636", "EPSG:4326", always_xy=True)
 
-        def normalize_coords(raw_x, raw_y, raw_lat=None, raw_lng=None):
-            if raw_lat is not None and raw_lng is not None:
-                lat = float(raw_lat)
-                lng = float(raw_lng)
-                if -90 <= lat <= 90 and -180 <= lng <= 180:
-                    return lat, lng
+    def norm_coords(raw_x, raw_y, raw_lat=None, raw_lng=None):
+        if raw_lat and raw_lng: return float(raw_lat), float(raw_lng)
+        x, y = float(raw_x), float(raw_y)
+        if -180 <= x <= 180 and -90 <= y <= 90: return y, x
+        return utm36_to_wgs84.transform(x, y)[::-1] # return lat, lon
 
-            x = float(raw_x)
-            y = float(raw_y)
-            if -180 <= x <= 180 and -90 <= y <= 90:
-                return y, x
+    # 1. Parse Metro
+    for node_id, data in METRO_GRAPH.nodes(data=True):
+        lat, lng = norm_coords(data.get('x', 0), data.get('y', 0), data.get('lat'), data.get('lng'))
+        NODES_DICT[node_id] = {
+            'id': node_id, 'lat': lat, 'lng': lng, 
+            'name': data.get('name', node_id), 
+            'type': 'station' if str(data.get('is_metro_station', '')).lower() in ('true', '1', 'yes') or not data.get('type') else data.get('type'),
+            'connections': []
+        }
 
-            lon, lat = utm36_to_wgs84.transform(x, y)
-            return lat, lon
+    for u, v, data in METRO_GRAPH.edges(data=True):
+        geom = parse_geometry_coords(data.get('geometry_coords')) or [[NODES_DICT[u]['lat'], NODES_DICT[u]['lng']], [NODES_DICT[v]['lat'], NODES_DICT[v]['lng']]]
+        EDGES_LIST.append({'from': u, 'to': v, 'type': data.get('type', 'metro'), 'line': data.get('line', ''), 'geometry_coords': geom})
+        if v not in NODES_DICT[u]['connections']: NODES_DICT[u]['connections'].append(v)
+        if u not in NODES_DICT[v]['connections']: NODES_DICT[v]['connections'].append(u)
 
-        NODES_DICT = {}
-        EDGES_LIST = []
-        STATION_TO_WALK_NODE = {}
-        WALK_NODE_TO_STATIONS = {}
+    # 2. Parse Walk
+    for node_id, data in WALK_GRAPH.nodes(data=True):
+        lat, lng = norm_coords(data.get('x', 0), data.get('y', 0))
+        WALK_NODE_IDS.append(node_id)
+        WALK_NODE_COORDS.append((lat, lng))
+        WALK_COORD_BY_ID[node_id] = (lat, lng)
+        WALK_NODES_API.append({'id': node_id, 'lat': lat, 'lng': lng, 'name': data.get('name', ''), 'type': 'walk'})
 
-        for node_id, node_data in metro_graph.nodes(data=True):
-            lat, lng = normalize_coords(
-                node_data.get('x', 0),
-                node_data.get('y', 0),
-                node_data.get('lat'),
-                node_data.get('lng')
-            )
-            node_type = node_data.get('type')
-            if not node_type:
-                if str(node_data.get('is_metro_station', '')).lower() in ('true', '1', 'yes'):
-                    node_type = 'station'
-                else:
-                    node_type = 'walk'
+    if cKDTree: WALK_KDTREE = cKDTree([(lng, lat) for lat, lng in WALK_NODE_COORDS])
 
-            NODES_DICT[node_id] = {
-                'id': node_id,
-                'lat': lat,
-                'lng': lng,
-                'name': node_data.get('name', node_id),
-                'type': node_type,
-                'connections': []
-            }
+    # 3. Link Stations to Walk Nodes
+    for s_id, s_data in NODES_DICT.items():
+        if s_data.get('type') != 'station': continue
+        if WALK_KDTREE:
+            _, idx = WALK_KDTREE.query((s_data['lng'], s_data['lat']), k=1)
+            STATION_TO_WALK_NODE[s_id] = WALK_NODE_IDS[int(idx)]
 
-        for u, v, edge_data in metro_graph.edges(data=True):
-            edge_type = edge_data.get('type', 'metro')
-            NODES_DICT[u]['connections'].append(v)
-            EDGES_LIST.append({'from': u, 'to': v, 'type': edge_type})
-            if v not in NODES_DICT[u]['connections']:
-                NODES_DICT[u]['connections'].append(v)
-            if u not in NODES_DICT[v]['connections']:
-                NODES_DICT[v]['connections'].append(u)
+    # 4. Build Combined Graph
+    COMBINED_BASE_GRAPH = nx.Graph()
+    for n_id, data in NODES_DICT.items():
+        COMBINED_BASE_GRAPH.add_node(n_id, id=n_id, lat=data['lat'], lng=data['lng'], name=data['name'], type=data['type'])
+    for n_id, (lat, lng) in WALK_COORD_BY_ID.items():
+        if n_id not in COMBINED_BASE_GRAPH:
+            COMBINED_BASE_GRAPH.add_node(n_id, id=n_id, lat=lat, lng=lng, name=f"walk_{n_id}", type='walk')
+            
+    for u, v, d in WALK_GRAPH.edges(data=True):
+        if u in COMBINED_BASE_GRAPH and v in COMBINED_BASE_GRAPH:
+            dist = float(d.get('length', haversine_distance(COMBINED_BASE_GRAPH.nodes[u]['lat'], COMBINED_BASE_GRAPH.nodes[u]['lng'], COMBINED_BASE_GRAPH.nodes[v]['lat'], COMBINED_BASE_GRAPH.nodes[v]['lng']) * 1000.0))
+            COMBINED_BASE_GRAPH.add_edge(u, v, mode='walk', type='walk', time=meters_to_minutes(dist, WALK_SPEED_KMH), length=dist)
 
-        metro_undirected = nx.Graph()
-        for node_id in NODES_DICT:
-            metro_undirected.add_node(node_id)
-        for edge in EDGES_LIST:
-            metro_undirected.add_edge(edge['from'], edge['to'])
-        METRO_COMPONENT_INDEX = {}
-        for idx, comp in enumerate(nx.connected_components(metro_undirected)):
-            for node_id in comp:
-                METRO_COMPONENT_INDEX[node_id] = idx
+    for u, v, d in METRO_GRAPH.edges(data=True):
+        if u in COMBINED_BASE_GRAPH and v in COMBINED_BASE_GRAPH:
+            dist = float(d.get('length', haversine_distance(COMBINED_BASE_GRAPH.nodes[u]['lat'], COMBINED_BASE_GRAPH.nodes[u]['lng'], COMBINED_BASE_GRAPH.nodes[v]['lat'], COMBINED_BASE_GRAPH.nodes[v]['lng']) * 1000.0))
+            COMBINED_BASE_GRAPH.add_edge(u, v, mode='metro', type='metro', time=meters_to_minutes(dist, METRO_SPEED_KMH), length=dist, geometry_coords=parse_geometry_coords(d.get('geometry_coords')))
 
-        WALK_NODE_IDS = []
-        WALK_NODE_COORDS = []
-        WALK_NODES_API = []
-        WALK_COORD_BY_ID = {}
-        for node_id, node_data in WALK_GRAPH.nodes(data=True):
-            lat, lng = normalize_coords(node_data.get('x', 0), node_data.get('y', 0))
-            WALK_NODE_IDS.append(node_id)
-            WALK_NODE_COORDS.append((lat, lng))
-            WALK_COORD_BY_ID[node_id] = (lat, lng)
-            WALK_NODES_API.append({
-                'id': node_id,
-                'lat': lat,
-                'lng': lng,
-                'name': node_data.get('name', ''),
-                'type': 'walk'
-            })
+    for s_id, w_id in STATION_TO_WALK_NODE.items():
+        if s_id in COMBINED_BASE_GRAPH and w_id in COMBINED_BASE_GRAPH:
+            dist = haversine_distance(COMBINED_BASE_GRAPH.nodes[s_id]['lat'], COMBINED_BASE_GRAPH.nodes[s_id]['lng'], COMBINED_BASE_GRAPH.nodes[w_id]['lat'], COMBINED_BASE_GRAPH.nodes[w_id]['lng']) * 1000.0
+            COMBINED_BASE_GRAPH.add_edge(s_id, w_id, mode='walk', type='walk_transfer', time=meters_to_minutes(dist, WALK_SPEED_KMH), length=dist)
 
-        WALK_KDTREE = cKDTree([(lng, lat) for lat, lng in WALK_NODE_COORDS]) if cKDTree else None
-
-        for station_id, station_data in NODES_DICT.items():
-            if station_data.get('type') != 'station':
-                continue
-            nearest_walk_id = find_nearest_walk_node(station_data['lat'], station_data['lng'])
-            if nearest_walk_id is None:
-                continue
-            STATION_TO_WALK_NODE[station_id] = nearest_walk_id
-            WALK_NODE_TO_STATIONS.setdefault(nearest_walk_id, []).append(station_id)
-
-        COMBINED_BASE_GRAPH = build_combined_base_graph()
-
-        print(
-            f"Loaded metro: {len(NODES_DICT)} nodes/{len(EDGES_LIST)} edges | "
-            f"walk: {len(WALK_NODE_IDS)} nodes | station links: {len(STATION_TO_WALK_NODE)}"
-        )
-        return True
-
-    except Exception as e:
-        print(f"Error loading graph: {e}")
-        return False
-
-
-def build_combined_base_graph():
-    """Build a base multimodal graph that includes walk + metro + station transfer edges."""
-    graph = nx.Graph()
-
-    for node_id, node_data in NODES_DICT.items():
-        graph.add_node(
-            node_id,
-            id=node_id,
-            lat=float(node_data['lat']),
-            lng=float(node_data['lng']),
-            name=node_data.get('name', node_id),
-            type=node_data.get('type', 'station')
-        )
-
-    for node_id, (lat, lng) in WALK_COORD_BY_ID.items():
-        if node_id in graph:
-            continue
-        graph.add_node(
-            node_id,
-            id=node_id,
-            lat=float(lat),
-            lng=float(lng),
-            name=f"walk_{node_id}",
-            type='walk'
-        )
-
-    if WALK_GRAPH is not None:
-        for u, v, edge_data in WALK_GRAPH.edges(data=True):
-            if u not in graph or v not in graph:
-                continue
-            a = graph.nodes[u]
-            b = graph.nodes[v]
-            fallback_len_m = haversine_distance(a['lat'], a['lng'], b['lat'], b['lng']) * 1000.0
-            time_min = edge_time_minutes({'mode': 'walk', **dict(edge_data)}, fallback_len_m)
-            length_m = float(edge_data.get('length', fallback_len_m) or fallback_len_m)
-            graph.add_edge(
-                u,
-                v,
-                mode='walk',
-                type='walk',
-                time=float(time_min),
-                length=float(length_m)
-            )
-
-    if METRO_GRAPH is not None:
-        for u, v, edge_data in METRO_GRAPH.edges(data=True):
-            if u not in graph or v not in graph:
-                continue
-            a = graph.nodes[u]
-            b = graph.nodes[v]
-            fallback_len_m = haversine_distance(a['lat'], a['lng'], b['lat'], b['lng']) * 1000.0
-            length_m = float(edge_data.get('length', fallback_len_m) or fallback_len_m)
-            time_min = edge_time_minutes({'mode': 'metro', **dict(edge_data)}, length_m)
-            geometry = parse_geometry_coords(edge_data.get('geometry_coords'))
-            graph.add_edge(
-                u,
-                v,
-                mode='metro',
-                type='metro',
-                line=edge_data.get('line', ''),
-                geometry_coords=geometry,
-                time=float(time_min),
-                length=float(length_m)
-            )
-
-    for station_id, walk_id in STATION_TO_WALK_NODE.items():
-        if station_id not in graph or walk_id not in graph:
-            continue
-        a = graph.nodes[station_id]
-        b = graph.nodes[walk_id]
-        dist_m = haversine_distance(a['lat'], a['lng'], b['lat'], b['lng']) * 1000.0
-        graph.add_edge(
-            station_id,
-            walk_id,
-            mode='walk',
-            type='walk_transfer',
-            time=meters_to_minutes(dist_m, WALK_SPEED_KMH),
-            length=dist_m
-        )
-
-    return graph
-
-# ============================================================================
-# COMPLETE ROUTING LOGIC
-# ============================================================================
-
-def find_k_nearest_walk_nodes(lat, lng, k=5):
-    """Find up to k nearest walk nodes to a coordinate."""
-    if not WALK_NODE_IDS:
-        return []
-
-    if WALK_KDTREE is None:
-        scored = []
-        for node_id, (n_lat, n_lng) in WALK_COORD_BY_ID.items():
-            dist_m = haversine_distance(lat, lng, n_lat, n_lng) * 1000.0
-            scored.append((dist_m, node_id))
-        scored.sort(key=lambda x: x[0])
-        return [nid for _, nid in scored[:k]]
-
-    kk = min(k, len(WALK_NODE_IDS))
-    dists, indices = WALK_KDTREE.query((lng, lat), k=kk)
-    if kk == 1:
-        indices = [indices]
-    return [WALK_NODE_IDS[int(i)] for i in indices]
-
-
-def find_nearest_walk_node(lat, lng):
-    """Find nearest walk-graph node to a coordinate."""
-    if not WALK_NODE_IDS:
-        return None
-
-    if WALK_KDTREE is not None:
-        _, idx = WALK_KDTREE.query((lng, lat), k=1)
-        return WALK_NODE_IDS[int(idx)]
-
-    best_idx = min(
-        range(len(WALK_NODE_COORDS)),
-        key=lambda i: (WALK_NODE_COORDS[i][0] - lat) ** 2 + (WALK_NODE_COORDS[i][1] - lng) ** 2
-    )
-    return WALK_NODE_IDS[best_idx]
-
+    return True
 
 def orient_edge_coords(coords, start_lat, start_lng):
-    """Orient polyline to start near the given start coordinate."""
-    if not coords:
-        return []
-    first = coords[0]
-    last = coords[-1]
-    d_first = (first[0] - start_lat) ** 2 + (first[1] - start_lng) ** 2
-    d_last = (last[0] - start_lat) ** 2 + (last[1] - start_lng) ** 2
-    if d_last < d_first:
+    if not coords: return []
+    if (coords[-1][0] - start_lat)**2 + (coords[-1][1] - start_lng)**2 < (coords[0][0] - start_lat)**2 + (coords[0][1] - start_lng)**2:
         return list(reversed(coords))
     return coords
 
-
 def build_route_segments(graph, path):
-    """Convert node path into grouped walk/metro segments with geometry and timing."""
+    """Giữ nguyên logic chia chặng gốc của Frontend"""
     segments = []
-    if not path or len(path) < 2:
-        return segments
-
+    if not path or len(path) < 2: return segments
     current = None
 
     for u, v in zip(path[:-1], path[1:]):
         edge_data = graph[u][v]
         mode = get_edge_mode(edge_data)
-        u_node = graph.nodes[u]
-        v_node = graph.nodes[v]
-
-        coords = edge_data.get('geometry_coords')
-        if not coords:
-            coords = [[u_node['lat'], u_node['lng']], [v_node['lat'], v_node['lng']]
-            ]
-        coords = orient_edge_coords(coords, u_node['lat'], u_node['lng'])
-
-        edge_time = float(edge_data.get('time', 0.0))
-        edge_len = float(edge_data.get('length', 0.0))
+        coords = orient_edge_coords(edge_data.get('geometry_coords') or [[graph.nodes[u]['lat'], graph.nodes[u]['lng']], [graph.nodes[v]['lat'], graph.nodes[v]['lng']]], graph.nodes[u]['lat'], graph.nodes[u]['lng'])
 
         if current is None or current['mode'] != mode:
             current = {
-                'mode': mode,
-                'from_id': u,
-                'to_id': v,
-                'from_name': node_name(u, u_node),
-                'to_name': node_name(v, v_node),
-                'node_ids': [u, v],
-                'coords': list(coords),
-                'time_min': edge_time,
-                'distance_m': edge_len,
+                'mode': mode, 'from_id': u, 'to_id': v, 
+                'from_name': node_name(u, graph.nodes[u]), 'to_name': node_name(v, graph.nodes[v]),
+                'node_ids': [u, v], 'coords': list(coords), 
+                'time_min': float(edge_data.get('time', 0.0)), 'distance_m': float(edge_data.get('length', 0.0))
             }
             segments.append(current)
             continue
 
         current['to_id'] = v
-        current['to_name'] = node_name(v, v_node)
+        current['to_name'] = node_name(v, graph.nodes[v])
         current['node_ids'].append(v)
-        current['time_min'] += edge_time
-        current['distance_m'] += edge_len
+        current['time_min'] += float(edge_data.get('time', 0.0))
+        current['distance_m'] += float(edge_data.get('length', 0.0))
         if current['coords'] and coords:
-            if current['coords'][-1] == coords[0]:
-                current['coords'].extend(coords[1:])
-            else:
-                current['coords'].extend(coords)
+            if current['coords'][-1] == coords[0]: current['coords'].extend(coords[1:])
+            else: current['coords'].extend(coords)
 
     return segments
 
-
 def build_detailed_steps(graph, segments):
+    """Giữ nguyên định dạng trả về Step cho UI"""
     steps = []
     for idx, seg in enumerate(segments, start=1):
-        station_names = [
-            node_name(node_id, graph.nodes[node_id])
-            for node_id in seg['node_ids']
-            if graph.nodes[node_id].get('type') == 'station'
-        ]
-        station_names = list(dict.fromkeys(station_names))
-
-        if seg['mode'] == 'metro':
-            title = f"Chặng {idx}: Đi metro từ {seg['from_name']} đến {seg['to_name']}"
+        if seg['mode'] == 'metro' and len(seg['node_ids']) > 2:
+            for m_idx, (u, v) in enumerate(zip(seg['node_ids'][:-1], seg['node_ids'][1:]), start=1):
+                steps.append({
+                    'mode': 'metro', 'title': f"Chặng {idx}.{m_idx}: Đi metro từ {node_name(u, graph.nodes[u])} đến {node_name(v, graph.nodes[v])}",
+                    'from': node_name(u, graph.nodes[u]), 'to': node_name(v, graph.nodes[v]),
+                    'time_min': round(float(graph[u][v].get('time', 0.0)), 2), 'distance_m': round(float(graph[u][v].get('length', 0.0)), 1),
+                    'stations': [node_name(u, graph.nodes[u]), node_name(v, graph.nodes[v])]
+                })
         else:
-            title = f"Chặng {idx}: Đi bộ từ {seg['from_name']} đến {seg['to_name']}"
-
-        steps.append({
-            'mode': seg['mode'],
-            'title': title,
-            'from': seg['from_name'],
-            'to': seg['to_name'],
-            'time_min': round(seg['time_min'], 2),
-            'distance_m': round(seg['distance_m'], 1),
-            'stations': station_names
-        })
+            stations = list(dict.fromkeys([node_name(n, graph.nodes[n]) for n in seg['node_ids'] if graph.nodes[n].get('type') == 'station']))
+            title = f"Chặng {idx}: Đi {'metro' if seg['mode'] == 'metro' else 'bộ'} từ {seg['from_name']} đến {seg['to_name']}"
+            steps.append({
+                'mode': seg['mode'], 'title': title, 'from': seg['from_name'], 'to': seg['to_name'],
+                'time_min': round(seg['time_min'], 2), 'distance_m': round(seg['distance_m'], 1), 'stations': stations
+            })
     return steps
 
-
 def find_complete_path(point_a, point_b, forbidden_nodes, forbidden_edges, forbidden_zones):
-    """Run unified A* from A to B on the combined walk+metro graph.
-    Now passes forbidden items as dynamic parameters instead of copying graph.
-    """
-    if COMBINED_BASE_GRAPH is None:
-        return None
+    if not COMBINED_BASE_GRAPH: return None
 
-    # Check if start/end points are in forbidden zones
+    # Check start/end against forbidden zones
     for zone in forbidden_zones:
-        dist_a = euclidean_distance(
-            point_a['lat'], point_a['lng'],
-            zone['center_lat'], zone['center_lng']
-        )
-        if dist_a <= zone['radius']:
-            return None
-        dist_b = euclidean_distance(
-            point_b['lat'], point_b['lng'],
-            zone['center_lat'], zone['center_lng']
-        )
-        if dist_b <= zone['radius']:
-            return None
+        rm = float(zone.get('radius_m', 0))
+        if haversine_distance(point_a['lat'], point_a['lng'], zone['center_lat'], zone['center_lng']) * 1000 <= rm: return None
+        if haversine_distance(point_b['lat'], point_b['lng'], zone['center_lat'], zone['center_lng']) * 1000 <= rm: return None
 
-    # Create temporary graph with virtual A/B points
     graph = COMBINED_BASE_GRAPH.copy()
     graph.add_node('__point_a__', id='__point_a__', lat=point_a['lat'], lng=point_a['lng'], name='Điểm A', type='point')
     graph.add_node('__point_b__', id='__point_b__', lat=point_b['lat'], lng=point_b['lng'], name='Điểm B', type='point')
 
-    nearest_a = find_k_nearest_walk_nodes(point_a['lat'], point_a['lng'], k=6)
-    nearest_b = find_k_nearest_walk_nodes(point_b['lat'], point_b['lng'], k=6)
-    if not nearest_a or not nearest_b:
-        return None
+    def link_virtual_node(v_id, point):
+        nearest = []
+        if WALK_KDTREE:
+            _, indices = WALK_KDTREE.query((point['lng'], point['lat']), k=6)
+            # Xử lý an toàn tương thích với cả numpy array và giá trị đơn
+            if hasattr(indices, '__iter__'):
+                nearest = [WALK_NODE_IDS[int(i)] for i in indices]
+            else:
+                nearest = [WALK_NODE_IDS[int(indices)]]
+                
+        for w_id in nearest:
+            if w_id not in graph: continue
+            dist = haversine_distance(point['lat'], point['lng'], graph.nodes[w_id]['lat'], graph.nodes[w_id]['lng']) * 1000
+            graph.add_edge(v_id, w_id, mode='walk', type='walk_access', time=meters_to_minutes(dist, WALK_SPEED_KMH), length=dist, geometry_coords=[[point['lat'], point['lng']], [graph.nodes[w_id]['lat'], graph.nodes[w_id]['lng']]])
+    
+    link_virtual_node('__point_a__', point_a)
+    link_virtual_node('__point_b__', point_b)
 
-    for walk_id in nearest_a:
-        if walk_id not in graph:
-            continue
-        walk_node = graph.nodes[walk_id]
-        dist_m = haversine_distance(point_a['lat'], point_a['lng'], walk_node['lat'], walk_node['lng']) * 1000.0
-        graph.add_edge(
-            '__point_a__',
-            walk_id,
-            mode='walk',
-            type='walk_access',
-            time=meters_to_minutes(dist_m, WALK_SPEED_KMH),
-            length=dist_m,
-            geometry_coords=[[point_a['lat'], point_a['lng']], [walk_node['lat'], walk_node['lng']]]
-        )
-
-    for walk_id in nearest_b:
-        if walk_id not in graph:
-            continue
-        walk_node = graph.nodes[walk_id]
-        dist_m = haversine_distance(point_b['lat'], point_b['lng'], walk_node['lat'], walk_node['lng']) * 1000.0
-        graph.add_edge(
-            '__point_b__',
-            walk_id,
-            mode='walk',
-            type='walk_access',
-            time=meters_to_minutes(dist_m, WALK_SPEED_KMH),
-            length=dist_m,
-            geometry_coords=[[point_b['lat'], point_b['lng']], [walk_node['lat'], walk_node['lng']]]
-        )
-
-    # Pass forbidden items as parameters - A* checks inline
-    path, total_time = a_star_on_graph(
-        graph, '__point_a__', '__point_b__',
-        forbidden_nodes=forbidden_nodes,
-        forbidden_edges=forbidden_edges,
-        forbidden_zones=forbidden_zones
-    )
-    if not path:
-        return None
+    path, total_time = a_star_on_graph(graph, '__point_a__', '__point_b__', forbidden_nodes, forbidden_edges, forbidden_zones)
+    if not path: return None
 
     segments = build_route_segments(graph, path)
-    steps = build_detailed_steps(graph, segments)
-
-    walk_segments = [seg['coords'] for seg in segments if seg['mode'] != 'metro']
-    metro_segments = [seg['coords'] for seg in segments if seg['mode'] == 'metro']
-    station_path = [
-        node_id for node_id in path
-        if node_id in NODES_DICT and NODES_DICT[node_id].get('type') == 'station'
-    ]
-    total_distance = sum(seg['distance_m'] for seg in segments)
-
     return {
         'path_nodes': path,
-        'station_path': station_path,
+        'station_path': [n for n in path if n in NODES_DICT and NODES_DICT[n].get('type') == 'station'],
         'segments': segments,
-        'walk_segments': walk_segments,
-        'metro_segments': metro_segments,
-        'steps': steps,
+        'walk_segments': [seg['coords'] for seg in segments if seg['mode'] != 'metro'],
+        'metro_segments': [seg['coords'] for seg in segments if seg['mode'] == 'metro'],
+        'steps': build_detailed_steps(graph, segments),
         'total_time_min': round(total_time, 2),
-        'total_distance_m': round(total_distance, 1)
+        'total_distance_m': round(sum(s['distance_m'] for s in segments), 1)
     }
 
 # ============================================================================
@@ -746,77 +382,82 @@ def find_complete_path(point_a, point_b, forbidden_nodes, forbidden_edges, forbi
 # ============================================================================
 
 class AppState:
-    """Manage application state (forbidden nodes/edges/zones)"""
-    
+    """Giữ nguyên State Management để đảm bảo logic Admin không bị mất"""
     def __init__(self):
         self.forbidden_nodes = set()
         self.forbidden_edges = set()
+        self.forbidden_edge_routes = []
         self.forbidden_zones = []
-        self.load_state()
     
-    def load_state(self):
-        """Load state from JSON file"""
-        if os.path.exists(APP_STATE_FILE):
-            try:
-                with open(APP_STATE_FILE, 'r') as f:
-                    data = json.load(f)
-                    self.forbidden_nodes = set(data.get('forbidden_nodes', []))
-                    self.forbidden_edges = set(tuple(e) for e in data.get('forbidden_edges', []))
-                    self.forbidden_zones = data.get('forbidden_zones', [])
-            except:
-                pass
-    
-    def save_state(self):
-        """Save state to JSON file"""
-        os.makedirs(os.path.dirname(APP_STATE_FILE), exist_ok=True)
-        with open(APP_STATE_FILE, 'w') as f:
-            data = {
-                'forbidden_nodes': list(self.forbidden_nodes),
-                'forbidden_edges': [list(e) for e in self.forbidden_edges],
-                'forbidden_zones': self.forbidden_zones,
-                'saved_at': datetime.now().isoformat()
-            }
-            json.dump(data, f, indent=2)
-    
-    def block_node(self, node_id):
-        """Block a node"""
-        self.forbidden_nodes.add(node_id)
-        self.save_state()
-    
-    def unblock_node(self, node_id):
-        """Unblock a node"""
-        self.forbidden_nodes.discard(node_id)
-        self.save_state()
+    def block_node(self, node_id): self.forbidden_nodes.add(node_id)
+    def unblock_node(self, node_id): self.forbidden_nodes.discard(node_id)
     
     def block_edge(self, node1, node2):
-        """Block an edge"""
-        self.forbidden_edges.add((node1, node2))
-        self.forbidden_edges.add((node2, node1))
-        self.save_state()
-    
-    def unblock_edge(self, node1, node2):
-        """Unblock an edge"""
-        self.forbidden_edges.discard((node1, node2))
-        self.forbidden_edges.discard((node2, node1))
-        self.save_state()
-    
-    def block_zone(self, center_lat, center_lng, radius):
-        """Block a zone"""
-        self.forbidden_zones.append({
-            'center_lat': center_lat,
-            'center_lng': center_lng,
-            'radius': radius
-        })
-        self.save_state()
-    
-    def reset_all(self):
-        """Reset all blocks"""
-        self.forbidden_nodes = set()
-        self.forbidden_edges = set()
-        self.forbidden_zones = []
-        self.save_state()
+        if not METRO_GRAPH or node1 not in METRO_GRAPH or node2 not in METRO_GRAPH:
+            self.forbidden_edges.update([(node1, node2), (node2, node1)])
+            self.forbidden_nodes.update([node1, node2])
+            return
+            
+        try: path = nx.shortest_path(METRO_GRAPH, node1, node2, weight='length')
+        except: path = [node1, node2]
+        
+        # Tái tạo mảng geometry_coords để Frontend vẽ đường màu đỏ nối các ga
+        geom_coords = []
+        for u, v in zip(path[:-1], path[1:]):
+            edge_data = METRO_GRAPH[u][v]
+            coords = parse_geometry_coords(edge_data.get('geometry_coords')) or [[METRO_GRAPH.nodes[u]['lat'], METRO_GRAPH.nodes[u]['lng']], [METRO_GRAPH.nodes[v]['lat'], METRO_GRAPH.nodes[v]['lng']]]
+            coords = orient_edge_coords(coords, METRO_GRAPH.nodes[u]['lat'], METRO_GRAPH.nodes[u]['lng'])
+            if geom_coords and coords and geom_coords[-1] == coords[0]:
+                geom_coords.extend(coords[1:])
+            else:
+                geom_coords.extend(coords)
 
-# Create app state instance
+        route = {
+            'start': node1, 
+            'end': node2, 
+            'path': path, 
+            'segments': [[u, v] for u, v in zip(path[:-1], path[1:])],
+            'geometry_coords': geom_coords # Trả lại key này cho Frontend
+        }
+        
+        for u, v in route['segments']: self.forbidden_edges.update([(u, v), (v, u)])
+        for n in route['path']: self.forbidden_nodes.add(n)
+        
+        self.forbidden_edge_routes = [r for r in self.forbidden_edge_routes if not (r.get('start') in (node1, node2) and r.get('end') in (node1, node2))]
+        self.forbidden_edge_routes.append(route)
+
+    def unblock_edge(self, node1, node2):
+        rem_routes, keep_routes = [], []
+        for r in self.forbidden_edge_routes:
+            if r['start'] in (node1, node2) and r['end'] in (node1, node2): rem_routes.append(r)
+            else: keep_routes.append(r)
+        
+        if rem_routes:
+            for r in rem_routes:
+                for u, v in r.get('segments', []): self.forbidden_edges.difference_update([(u, v), (v, u)])
+                for n in r.get('path', []): self.forbidden_nodes.discard(n)
+        else:
+            self.forbidden_edges.difference_update([(node1, node2), (node2, node1)])
+            self.forbidden_nodes.difference_update([node1, node2])
+        self.forbidden_edge_routes = keep_routes
+
+    def block_zone(self, center_lat, center_lng, radius, boundary_lat=None, boundary_lng=None):
+        zone = {'center_lat': float(center_lat), 'center_lng': float(center_lng), 'radius': radius}
+        if boundary_lat is not None and boundary_lng is not None:
+            zone['radius_m'] = haversine_distance(zone['center_lat'], zone['center_lng'], float(boundary_lat), float(boundary_lng)) * 1000.0
+        else:
+            try: zone['radius_m'] = float(radius) * 111000.0
+            except: zone['radius_m'] = 0.0
+        self.forbidden_zones.append(zone)
+
+    def unblock_zone(self, center_lat, center_lng, radius):
+        self.forbidden_zones = [z for z in self.forbidden_zones if not (abs(z['center_lat'] - center_lat) < 1e-6 and abs(z['center_lng'] - center_lng) < 1e-6 and abs(z.get('radius', 0.0) - radius) < 1e-6)]
+    
+    def reset_all(self): self.__init__()
+    def reset_nodes(self): self.forbidden_nodes = set()
+    def reset_edges(self): self.forbidden_edges, self.forbidden_edge_routes = set(), []
+    def reset_zones(self): self.forbidden_zones = []
+
 app_state = AppState()
 
 # ============================================================================
@@ -824,198 +465,113 @@ app_state = AppState()
 # ============================================================================
 
 @app.route('/')
-def serve_index():
-    """Serve index.html with proper MIME type"""
-    return send_file('index.html', mimetype='text/html')
+def serve_index(): return send_file('index.html', mimetype='text/html')
 
 @app.route('/api/graph-data', methods=['GET'])
 def get_graph_data():
-    """API: Get graph data (nodes + edges)"""
-    if not NODES_DICT:
-        return jsonify({
-            'error': 'Graph not loaded',
-            'nodes': [],
-            'station_nodes': [],
-            'walk_nodes': [],
-            'edges': []
-        }), 200
+    if not NODES_DICT: return jsonify({'error': 'Graph not loaded', 'nodes': [], 'station_nodes': [], 'walk_nodes': [], 'edges': []}), 200
     
-    nodes = []
-    station_nodes = []
-    walk_nodes = []
-    for node_id, node in NODES_DICT.items():
-        node_data = {
-            'id': node_id,
-            'lat': node['lat'],
-            'lng': node['lng'],
-            'name': node.get('name', ''),
-            'type': node.get('type', 'walk')
-        }
-        nodes.append(node_data)
-        if node_data['type'] == 'station':
-            station_nodes.append(node_data)
-        else:
-            walk_nodes.append(node_data)
-
-    # Walk nodes come from the dedicated walk graph and can be much larger than metro nodes.
-    if WALK_NODES_API:
-        walk_nodes = WALK_NODES_API
-    
+    nodes, station_nodes = [], []
+    for n_id, n in NODES_DICT.items():
+        data = {'id': n_id, 'lat': n['lat'], 'lng': n['lng'], 'name': n.get('name', ''), 'type': n.get('type', 'walk')}
+        nodes.append(data)
+        if data['type'] == 'station': station_nodes.append(data)
+        
     return jsonify({
-        'nodes': nodes,
-        'station_nodes': station_nodes,
-        'walk_nodes': walk_nodes,
-        'edges': EDGES_LIST,
-        'forbidden_nodes': list(app_state.forbidden_nodes),
-        'forbidden_edges': [list(e) for e in app_state.forbidden_edges],
-        'forbidden_zones': app_state.forbidden_zones
+        'nodes': nodes, 'station_nodes': station_nodes, 'walk_nodes': WALK_NODES_API, 'edges': EDGES_LIST,
+        'forbidden_nodes': list(app_state.forbidden_nodes), 'forbidden_edges': [list(e) for e in app_state.forbidden_edges],
+        'forbidden_edge_routes': app_state.forbidden_edge_routes, 'forbidden_zones': app_state.forbidden_zones
     }), 200
-
 
 @app.route('/api/find-path', methods=['POST'])
 def find_path():
-    """API: Find path from point A to point B"""
-    try:
-        data = request.get_json()
-        point_a = data.get('pointA', {})
-        point_b = data.get('pointB', {})
-        
-        if not point_a or not point_b:
-            return jsonify({'error': 'Missing points'}), 400
-        
-        result = find_complete_path(
-            point_a, point_b,
-            app_state.forbidden_nodes,
-            app_state.forbidden_edges,
-            app_state.forbidden_zones
-        )
-        
-        if not result:
-            return jsonify({'error': 'No path found'}), 404
-        
-        return jsonify({
-            'path': result.get('station_path', []),
-            'path_nodes': result.get('path_nodes', []),
-            'steps': result.get('steps', []),
-            'segments': result.get('segments', []),
-            'walk_segments': result.get('walk_segments', []),
-            'metro_segments': result.get('metro_segments', []),
-            'total_time_min': result.get('total_time_min', 0.0),
-            'total_distance_m': result.get('total_distance_m', 0.0),
-            'distance': len(result.get('path_nodes', []))
-        }), 200
+    data = request.get_json()
+    pointA = data.get('pointA')
+    pointB = data.get('pointB')
     
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    if not pointA or not pointB: 
+        return jsonify({'error': 'Missing points'}), 400
+    
+    # --- THÊM LOGIC KIỂM TRA TỌA ĐỘ TẠI ĐÂY ---
+    if not is_in_st_petersburg(pointA['lat'], pointA['lng']) or \
+       not is_in_st_petersburg(pointB['lat'], pointB['lng']):
+        return jsonify({'error': 'Tọa độ không hợp lệ, ngoài thành phố St. Petersburg'}), 400
+    # ------------------------------------------
+
+    res = find_complete_path(pointA, pointB, app_state.forbidden_nodes, app_state.forbidden_edges, app_state.forbidden_zones)
+    if not res: 
+        return jsonify({'error': 'No path found'}), 404
+    
+    return jsonify({
+        'path': res.get('station_path', []), 'path_nodes': res.get('path_nodes', []),
+        'steps': res.get('steps', []), 'segments': res.get('segments', []),
+        'walk_segments': res.get('walk_segments', []), 'metro_segments': res.get('metro_segments', []),
+        'total_time_min': res.get('total_time_min', 0.0), 'total_distance_m': res.get('total_distance_m', 0.0),
+        'distance': len(res.get('path_nodes', []))
+    }), 200
 
 @app.route('/api/admin/login', methods=['POST'])
 def admin_login():
-    """API: Admin login"""
-    data = request.get_json()
-    password = data.get('password', '')
-    
-    if password == '123456':
-        return jsonify({'success': True}), 200
-    else:
-        return jsonify({'error': 'Invalid password'}), 401
+    if request.get_json().get('password') == '123456': return jsonify({'success': True}), 200
+    return jsonify({'error': 'Invalid password'}), 401
 
 @app.route('/api/admin/block-node', methods=['POST'])
 def block_node():
-    """API: Block a node"""
     data = request.get_json()
-    node_id = data.get('node_id', '')
-    password = data.get('password', '')
-    
-    if password != '123456':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    app_state.block_node(node_id)
-    return jsonify({'success': True, 'blocked_node': node_id}), 200
+    if data.get('password') != '123456': return jsonify({'error': 'Unauthorized'}), 401
+    app_state.block_node(data.get('node_id'))
+    return jsonify({'success': True, 'blocked_node': data.get('node_id')}), 200
 
 @app.route('/api/admin/unblock-node', methods=['POST'])
-def unblock_node():
-    """API: Unblock a node"""
+def unblock_node_api():
     data = request.get_json()
-    node_id = data.get('node_id', '')
-    password = data.get('password', '')
-    
-    if password != '123456':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    app_state.unblock_node(node_id)
-    return jsonify({'success': True, 'unblocked_node': node_id}), 200
+    if data.get('password') != '123456': return jsonify({'error': 'Unauthorized'}), 401
+    app_state.unblock_node(data.get('node_id'))
+    return jsonify({'success': True, 'unblocked_node': data.get('node_id')}), 200
 
 @app.route('/api/admin/block-edge', methods=['POST'])
 def block_edge():
-    """API: Block an edge"""
     data = request.get_json()
-    node1 = data.get('node1', '')
-    node2 = data.get('node2', '')
-    password = data.get('password', '')
-    
-    if password != '123456':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    app_state.block_edge(node1, node2)
-    return jsonify({'success': True, 'blocked_edge': [node1, node2]}), 200
+    if data.get('password') != '123456': return jsonify({'error': 'Unauthorized'}), 401
+    app_state.block_edge(data.get('node1'), data.get('node2'))
+    return jsonify({'success': True, 'blocked_edge': [data.get('node1'), data.get('node2')]}), 200
 
 @app.route('/api/admin/unblock-edge', methods=['POST'])
-def unblock_edge():
-    """API: Unblock an edge"""
+def unblock_edge_api():
     data = request.get_json()
-    node1 = data.get('node1', '')
-    node2 = data.get('node2', '')
-    password = data.get('password', '')
-    
-    if password != '123456':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    app_state.unblock_edge(node1, node2)
-    return jsonify({'success': True, 'unblocked_edge': [node1, node2]}), 200
+    if data.get('password') != '123456': return jsonify({'error': 'Unauthorized'}), 401
+    app_state.unblock_edge(data.get('node1'), data.get('node2'))
+    return jsonify({'success': True, 'unblocked_edge': [data.get('node1'), data.get('node2')]}), 200
 
 @app.route('/api/admin/block-zone', methods=['POST'])
 def block_zone():
-    """API: Block a zone"""
     data = request.get_json()
-    center_lat = data.get('center_lat')
-    center_lng = data.get('center_lng')
-    radius = data.get('radius')
-    password = data.get('password', '')
-    
-    if password != '123456':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    if center_lat is None or center_lng is None or radius is None:
-        return jsonify({'error': 'Missing zone data'}), 400
-    
-    app_state.block_zone(center_lat, center_lng, radius)
-    return jsonify({'success': True, 'blocked_zone': {
-        'center': [center_lat, center_lng],
-        'radius': radius
-    }}), 200
+    if data.get('password') != '123456': return jsonify({'error': 'Unauthorized'}), 401
+    if None in (data.get('center_lat'), data.get('center_lng'), data.get('radius')): return jsonify({'error': 'Missing zone data'}), 400
+    app_state.block_zone(data.get('center_lat'), data.get('center_lng'), data.get('radius'), data.get('boundary_lat'), data.get('boundary_lng'))
+    return jsonify({'success': True, 'blocked_zone': {'center': [data['center_lat'], data['center_lng']], 'radius': data['radius']}}), 200
+
+@app.route('/api/admin/unblock-zone', methods=['POST'])
+def unblock_zone_api():
+    data = request.get_json()
+    if data.get('password') != '123456': return jsonify({'error': 'Unauthorized'}), 401
+    if None in (data.get('center_lat'), data.get('center_lng'), data.get('radius')): return jsonify({'error': 'Missing zone data'}), 400
+    app_state.unblock_zone(data.get('center_lat'), data.get('center_lng'), data.get('radius'))
+    return jsonify({'success': True, 'unblocked_zone': {'center': [data['center_lat'], data['center_lng']], 'radius': data['radius']}}), 200
 
 @app.route('/api/admin/reset', methods=['POST'])
 def reset_state():
-    """API: Reset all blocks"""
     data = request.get_json()
-    password = data.get('password', '')
-    
-    if password != '123456':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    app_state.reset_all()
-    return jsonify({'success': True, 'message': 'All blocks reset'}), 200
-
-# ============================================================================
-# APPLICATION STARTUP
-# ============================================================================
+    if data.get('password') != '123456': return jsonify({'error': 'Unauthorized'}), 401
+    scope = data.get('scope', 'all')
+    if scope == 'nodes': app_state.reset_nodes()
+    elif scope == 'edges': app_state.reset_edges()
+    elif scope == 'zones': app_state.reset_zones()
+    else: app_state.reset_all()
+    return jsonify({'success': True, 'message': f'{scope} blocks reset', 'scope': scope}), 200
 
 if __name__ == '__main__':
-    print("[*] Loading graph...")
+    print("[*] Loading St. Petersburg Metro graph...")
     load_graph_with_coordinates()
-    
-    print(f"[✓] Starting Flask server...")
-    print(f"[*] Open http://localhost:5000 in your browser")
-    print(f"[*] Admin password: 123456")
-    
+    print(f"[✓] Starting Flask server on http://localhost:5000")
     app.run(debug=False, host='0.0.0.0', port=5000)
