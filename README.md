@@ -1,91 +1,63 @@
-# Smart Map Pro — Multimodal Route Finder
+﻿# Smart Map Pro — Trợ lý Tìm đường Đa phương thức
 
-Ứng dụng
-
-Flask + Leaflet để tìm đường đa phương thức (đi bộ + metro) trên \đồ thị thành phố.
-
-Key points:
-
-- Vùng cấm (zone) cấm cả đi bộ và metro.
-- Cấm một cạnh (edge) sẽ cấm tất cả các ga trên đoạn tuyến đó.
-- Backend lưu bán kính vùng dưới dạng mét (`radius_m`) và so sánh bằng khoảng cách Haversine.
+Ứng dụng tìm đường kết hợp linh hoạt giữa **Đi bộ** và **Tàu điện ngầm (Metro)** tại khu vực St. Petersburg. Hệ thống được xây dựng bằng Python (Flask + thư viện xử lý đồ thị NetworkX) cho Backend và giao diện bản đồ trực quan bằng JavaScript (Leaflet.js + TailwindCSS) ở Frontend.
 
 ---
 
-## Quickstart
+## 🌟 Các tính năng chính
 
-1. Cài dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-2. Chuẩn bị dữ liệu: đặt các file đồ thị trong `graph/` (ví dụ `graph/spd_metro.graphml`).
-3. Chạy server:
-
-```bash
-python main.py
-```
-
-4. Mở GUI: http://localhost:5000
+- **Định tuyến Đa phương thức:** Thuật toán A* (A-Star) tự động tính toán chuỗi chặng đi tối ưu nhất về thời gian, kết hợp mượt mà giữa các đoạn đi bộ trên phố và quá trình bắt chuyến di chuyển bằng tàu điện ngầm.
+- **Mô phỏng sự cố theo Thời gian thực (Admin Mode):** Giao diện quản trị viên cho phép giả lập các khu vực tắc đường, thiên tai hoặc nhà ga ngừng hoạt động một cách linh hoạt mà không cần khởi động lại ứng dụng:
+  - **🔴 Cấm Vùng (Zone Blocking):** Khoanh vùng khu vực chịu ảnh hưởng theo bán kính. Mọi thao tác đi qua khu vực này (kể cả trên mặt đất lẫn ngầm) đều bị buộc phải chuyển hướng đi vòng.
+  - **🔗 Cấm Cạnh (Edge Blocking):** Chặn cụ thể tuyến đường di chuyển giữa hai ga metro nối tiếp nhau (mô phỏng đường ray bảo trì).
+  - **📍 Cấm Ga/Điểm (Node Blocking):** Đóng cửa hoàn toàn một nhà ga nhất định (mô phỏng cháy nổ hoặc sửa chữa ga).
+- **Xử lý Bộ nhớ Tại chỗ (In-Memory Tracking):** Các lệnh thay đổi cấu trúc đồ thị được Backend lưu cục bộ trên RAM (thông qua class `AppState`). Không yêu cầu database phức tạp, giúp thuật toán phản hồi mượt mà và cực nhanh.
 
 ---
 
-## Hành vi cấm (Important)
+## 🚀 Hướng dẫn Cài đặt & Khởi chạy
 
-- Zone: toàn bộ khu vực hình tròn bị cấm cho mọi phương thức (walking & metro). Backend so sánh bằng mét; frontend gửi bán kính dạng delta-degrees nhưng server sẽ chuyển sang `radius_m`.
-- Edge: khi admin chặn một cạnh, hệ thống sẽ xây dựng tuyến metro tương ứng và đánh dấu tất cả ga trên tuyến đó là `forbidden_nodes` — nghĩa là không thể đi qua các ga này.
+1. **Cài đặt các thư viện cần thiết:**
+   `ash
+   pip install -r requirements.txt
+   `
 
----
+2. **Chuẩn bị dữ liệu (Graph Data):** Đảm bảo các file mô tả mạng lưới bản đồ đã được đặt chuẩn xác trong thư mục `graph/`:
+   - `graph/spd_metro.graphml` (Dữ liệu mạng lưới tàu điện)
+   - `graph/spd_walk.graphml` (Dữ liệu mạng lưới đường đi bộ)
 
-## API (tóm tắt)
+3. **Khởi chạy Máy chủ (Server):**
+   `ash
+   python main.py
+   `
 
-Public:
-
-- `GET /api/graph-data` — trả về nodes, edges, forbidden_*
-- `POST /api/find-path` — body: `{ "pointA": {lat,lng}, "pointB": {lat,lng} }` → trả `path_nodes`, `metro_segments`, `walk_segments`, `steps`, `total_distance_m`, `total_time_min`.
-
-Admin (password mặc định `123456` — thay đổi trong `main.py` nếu cần):
-
-- `POST /api/admin/login` — {password}
-- `POST /api/admin/block-node` — {node_id, password}
-- `POST /api/admin/unblock-node` — {node_id, password}
-- `POST /api/admin/block-edge` — {node1, node2, password}
-- `POST /api/admin/unblock-edge` — {node1, node2, password}
-- `POST /api/admin/block-zone` — {center_lat, center_lng, radius, [boundary_lat, boundary_lng], password}
-- `POST /api/admin/unblock-zone` — {center_lat, center_lng, radius, password}
-- `POST /api/admin/reset` — {scope: all|nodes|edges|zones, password}
-
-Notes:
-
-- When posting `block-zone`, if you include `boundary_lat/boundary_lng` the server computes exact `radius_m` from that boundary point. Otherwise it converts the provided `radius` (assumed as delta-degrees) into meters by multiplying ~111000.
+4. **Sử dụng Ứng dụng:**
+   Mở trình duyệt web của bạn và truy cập địa chỉ: http://localhost:5000
 
 ---
 
-## Troubleshooting
+## 📖 Hướng dẫn Sử dụng Chi tiết
 
-- Nếu server báo lỗi thiếu graph files: kiểm tra `graph/spd_metro.graphml` và `graph/spd_walk.graphml`.
-- Nếu đường vẫn hiển thị sau khi cấm: refresh trang (frontend bôi cũ có thể còn route cũ); hệ thống đã xóa route cũ khi reload dữ liệu.
-- Nếu route trả về mặc định và vẫn đi vào vùng cấm: đảm bảo server đang chạy phiên bản mới (restart server sau thay đổi code).
+### 1. Dành cho Người dùng (Tìm đường)
+- **Bước 1:** Ngay khi mở bản đồ, bảng điều khiển mặc định yêu cầu bạn chọn điểm xuất phát. Hãy **click chuột trái** vào một vị trí cụ thể trên bản đồ làm **Điểm A**.
+- **Bước 2:** Tiếp tục **click chuột trái** vào vị trí đích đến để tạo **Điểm B**.
+- **Bước 3:** Bấm nút **"TÌM ĐƯỜNG"** màu xanh.
+- **Bước 4:** Lộ trình sẽ xuất hiện (Đoạn màu cam là đoạn đi bộ, các đoạn màu khác là line Metro theo từng chặng). Bảng bên trái sẽ hiển thị chi tiết khoảng cách, thời gian và chỉ dẫn từng chặng phân tầng rõ ràng.
+- *Tip:* Bạn có thể bật chức năng tùy chọn "Hiện tất cả ga" để dễ dàng thấy hệ thống đường ngầm trên nền đồ thị.
 
----
-
-## Development notes
-
-- Entry point: `main.py` — chứa load graph, xây dựng `COMBINED_BASE_GRAPH`, A* pathfinding và các API.
-- Frontend: `index.html` — Leaflet map + admin UI.
-- Forbidden state: `AppState` (in-memory) with `forbidden_nodes`, `forbidden_edges`, `forbidden_edge_routes`, `forbidden_zones`. No long-term persistence (cache/ app_state.json used for debugging only).
-
----
-
-## Contributing ideas
-
-- Improve heuristics for mixed-mode routing.
-- Add auth for admin endpoints.
-- Add unit tests for geometry/on-zone checks.
+### 2. Dành cho Quản trị viên (Kiểm thử mô phỏng sự cố)
+- **Đăng nhập:** Cuộn xuống góc dưới cùng bên thanh menu trái, nhập mật khẩu admin (Mặc định: `123456`) và ấn "Vào".
+- **Sử dụng Chế độ Cấm (Block Mode):**
+  - **Cấm Ga:** Nhấn vào "📍 Cấm Ga", đảm bảo nút "CẤM" màu đỏ phía trên đang được chọn, sau đó nhấp vào ga metro mà bạn muốn đóng cửa trên bản đồ (nhân vật sẽ tránh ga này).
+  - **Cấm Cạnh:** Nhấn vào "🔗 Cấm Cạnh", bật "Hiện tất cả ga" để dễ nhìn. Trình tự làm: click đúp ga đầu tiên, sau đó click ga kế tiếp, đường link bị cấm sẽ hiện màu đỏ đậm báo hiệu mất kết nối.
+  - **Cấm Vùng:** Nhấn "🔴 Cấm Vùng", nhấp điểm đầu tiên để chọn tâm vùng cấm, kéo thả và nhấp điểm thứ hai tạo bán kính. Một vòng tròn đánh dấu vùng cấm sẽ xuất hiện trên bản đồ.
+- **Gỡ bỏ Cấm (Unblock Mode):**
+  - Để gỡ đối tượng độc lập: Đổi tab sang "HỦY" (màu xanh lá thẫm) ở trên cùng. Tương tự như trên, sau đó click lại vào ga, cạnh, hoặc vùng cấm hiện hữu để giải phóng nó.
+  - Chức năng tiện ích: Bạn có thể chọn "Xóa tất cả điểm/cạnh/vùng..." trên bảng menu bằng các nút dọn dẹp màu nhanh gọn.
 
 ---
 
-License: (add your preferred license)
-
-Contact / Maintainer: repository owner
+## 📂 Cấu trúc Dự án
+Để tìm hiểu sâu hơn về kỹ thuật và logic thuật toán đằng sau Smart Map Pro, vui lòng tham khảo các tài liệu phân tích kỹ thuật của dự án:
+- [Ý Tưởng Thuật Toán (algorithm_concept.md)](algorithm_concept.md) - Giải thích cụ thể cách thuật toán A-Star đa phương thức hoạt động với hai lớp mạng lưới đan tầng.
+- [Kiến trúc Phần Mềm (software_architecture.md)](software_architecture.md) - Các chi tiết kỹ thuật về luồng giao tiếp giữa SPA (Leaflet) và máy chủ Python (Flask).
