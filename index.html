@@ -8,6 +8,7 @@
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Inter', sans-serif; }
@@ -119,6 +120,27 @@
             attribution: '© OpenStreetMap',
             maxZoom: 19
         }).addTo(map);
+
+        let cityBoundary = null;
+
+        // Tải đường biên giới St. Petersburg thực tế từ OpenStreetMap
+        fetch('https://nominatim.openstreetmap.org/search?state=Saint+Petersburg&country=Russia&polygon_geojson=1&format=json')
+            .then(res => res.json())
+            .then(data => {
+                if (data && data.length > 0) {
+                    cityBoundary = data[0].geojson;
+                    L.geoJSON(cityBoundary, {
+                        style: {
+                            color: '#475569',
+                            weight: 2,
+                            fillOpacity: 0,
+                            dashArray: '5, 5',
+                            interactive: false
+                        }
+                    }).addTo(map);
+                }
+            })
+            .catch(err => console.error("Lỗi tải biên giới:", err));
 
         let pointA = null, pointB = null;
         let pointAMarker = null, pointBMarker = null;
@@ -394,6 +416,21 @@
         function handleMapClick(e) {
             const lat = e.latlng.lat;
             const lng = e.latlng.lng;
+
+            // Kiểm tra điểm nằm ngoài St. Petersburg bằng Turf.js
+            if (cityBoundary) {
+                const pt = turf.point([lng, lat]);
+                if (!turf.booleanPointInPolygon(pt, cityBoundary)) {
+                    alert("Lỗi: Điểm bạn chọn nằm ngoài giới hạn thành phố St. Petersburg. Vui lòng chọn điểm nằm bên trong đường biên giới màu xám!");
+                    return;
+                }
+            } else {
+                // Fallback nếu chưa tải xong
+                if (lat < 59.4000 || lat > 60.4000 || lng < 29.4000 || lng > 31.0000) {
+                    alert("Lỗi: Điểm bạn chọn nằm quá xa thành phố St. Petersburg!");
+                    return;
+                }
+            }
 
             if (adminMode === 'block' && blockMethod) {
                 handleAdminBlockClick(lat, lng);
