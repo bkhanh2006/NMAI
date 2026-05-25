@@ -91,7 +91,7 @@
                     <button id="btn-mode-block" onclick="setAdminMode('block')" class="flex-1 py-2 text-xs font-black rounded bg-red-600 text-white">CẤM</button>
                     <button id="btn-mode-unblock" onclick="setAdminMode('unblock')" class="flex-1 py-2 text-xs font-black rounded border border-green-200 bg-green-50 text-green-600">HỦY</button>
                 </div>
-                <div class="grid grid-cols-2 gap-2">
+                <div id="admin-reset-buttons" class="hidden grid grid-cols-2 gap-2">
                     <button onclick="resetForbiddenNodes()" class="py-2 text-xs font-black rounded border border-rose-200 bg-rose-50 text-rose-700">Xóa tất cả điểm cấm</button>
                     <button onclick="resetForbiddenEdges()" class="py-2 text-xs font-black rounded border border-orange-200 bg-orange-50 text-orange-700">Xóa tất cả cạnh cấm</button>
                     <button onclick="resetForbiddenZones()" class="py-2 text-xs font-black rounded border border-amber-200 bg-amber-50 text-amber-700">Xóa tất cả vùng cấm</button>
@@ -621,7 +621,7 @@
                 if (response.ok) {
                     document.getElementById('admin-login-box').classList.add('hidden');
                     document.getElementById('admin-controls').classList.remove('hidden');
-                    adminMode = 'block';
+                    setAdminMode('block');
                 } else {
                     alert('Mật khẩu sai');
                 }
@@ -666,6 +666,7 @@
             const blockBtn = document.getElementById('btn-mode-block');
             const unblockBtn = document.getElementById('btn-mode-unblock');
             const methodButtons = document.querySelectorAll('[id^="method-"]');
+            const resetButtons = document.getElementById('admin-reset-buttons');
             
             if (mode === 'block') {
                 blockBtn.classList.add('bg-red-600', 'text-white');
@@ -673,13 +674,15 @@
                 unblockBtn.classList.add('border-green-200', 'bg-green-50', 'text-green-600');
                 unblockBtn.classList.remove('bg-green-600', 'text-white');
                 methodButtons.forEach(btn => btn.classList.remove('hidden'));
+                resetButtons.classList.add('hidden');
                 document.getElementById('admin-help-text').textContent = 'Chọn phương thức cấm';
             } else if (mode === 'unblock') {
                 blockBtn.classList.add('border-red-200', 'bg-red-50', 'text-red-600');
                 blockBtn.classList.remove('bg-red-600', 'text-white');
                 unblockBtn.classList.add('bg-green-600', 'text-white');
                 unblockBtn.classList.remove('border-green-200', 'bg-green-50', 'text-green-600');
-                methodButtons.forEach(btn => btn.classList.remove('hidden'));
+                methodButtons.forEach(btn => btn.classList.add('hidden'));
+                resetButtons.classList.remove('hidden');
                 document.getElementById('admin-help-text').textContent = 'Chọn phương thức hủy cấm';
             }
         }
