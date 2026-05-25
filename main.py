@@ -576,6 +576,29 @@ def get_graph_data():
         'forbidden_edge_routes': app_state.forbidden_edge_routes, 'forbidden_zones': app_state.forbidden_zones
     }), 200
 
+@app.route('/api/validate-point', methods=['POST'])
+def validate_point():
+    data = request.get_json()
+    lat = data.get('lat')
+    lng = data.get('lng')
+    
+    if lat is None or lng is None:
+        return jsonify({'error': 'Missing coordinates'}), 400
+
+    if not is_in_st_petersburg(lat, lng):
+        return jsonify({'error': 'Tọa độ không hợp lệ, ngoài thành phố St. Petersburg'}), 400
+
+    if WALK_KDTREE:
+        _, idx = WALK_KDTREE.query((lng, lat), k=1)
+        node_id = WALK_NODE_IDS[int(idx)]
+        node_coord = WALK_COORD_BY_ID[node_id]
+        dist_m = haversine_distance(lat, lng, node_coord[0], node_coord[1]) * 1000
+
+        if dist_m > 500:
+            return jsonify({'error': 'Khu vực không thể di chuyển tới (cách điểm đi bộ gần nhất > 500m). Các vùng trên biển, sông hồ hoặc quá xa đường xá không thể chọn.'}), 400
+            
+    return jsonify({'success': True}), 200
+
 @app.route('/api/find-path', methods=['POST'])
 def find_path():
     data = request.get_json()

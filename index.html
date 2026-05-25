@@ -413,7 +413,7 @@
         // Map click handler
         map.on('click', handleMapClick);
 
-        function handleMapClick(e) {
+        async function handleMapClick(e) {
             const lat = e.latlng.lat;
             const lng = e.latlng.lng;
 
@@ -440,6 +440,22 @@
             if (adminMode === 'unblock' && blockMethod) {
                 handleAdminUnblockClick(lat, lng);
                 return;
+            }
+
+            try {
+                const response = await fetch('/api/validate-point', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ lat, lng })
+                });
+
+                if (!response.ok) {
+                    const errData = await response.json().catch(() => null);
+                    alert((errData && errData.error) ? errData.error : "Điểm chọn không hợp lệ.");
+                    return;
+                }
+            } catch (err) {
+                console.error("Lỗi xác thực điểm:", err);
             }
 
             if (!pointA) {
@@ -491,7 +507,13 @@
                     body: JSON.stringify({ pointA, pointB })
                 });
 
-                if (!response.ok) throw new Error(await response.text());
+                if (!response.ok) {
+                    const errData = await response.json().catch(() => null);
+                    if (errData && errData.error) {
+                        throw new Error(errData.error);
+                    }
+                    throw new Error(await response.text());
+                }
 
                 const result = await response.json();
                 displayRoute(result);
