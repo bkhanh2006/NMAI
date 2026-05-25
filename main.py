@@ -143,27 +143,8 @@ def get_edge_mode(edge_data):
 # ============================================================================
 
 def a_star_on_graph(graph, start_id, end_id, forbidden_nodes=None, forbidden_edges=None, forbidden_zones=None):
-    """Hàm A* duy nhất dùng cho cả đi bộ và metro, xử lý cấm đường trực tiếp"""
+    """A* tinh gọn: các cạnh bị cấm đã có time=inf nên không cần kiểm tra trong vòng lặp."""
     if start_id not in graph or end_id not in graph: return None, float('inf')
-
-    forbidden_nodes = forbidden_nodes or set()
-    forbidden_edges = forbidden_edges or set()
-    forbidden_zones = forbidden_zones or []
-
-    def is_node_forbidden(n_id):
-        if n_id in forbidden_nodes: return True
-        if forbidden_zones and n_id in graph:
-            n_data = graph.nodes[n_id]
-            for z in forbidden_zones:
-                if haversine_distance(n_data['lat'], n_data['lng'], z['center_lat'], z['center_lng']) * 1000.0 <= float(z.get('radius_m', 0)):
-                    return True
-        return False
-
-    def is_edge_forbidden(u, v):
-        if (u, v) in forbidden_edges or (v, u) in forbidden_edges: return True
-        return edge_intersects_forbidden_zone(graph, u, v, forbidden_zones)
-
-    if is_node_forbidden(start_id) or is_node_forbidden(end_id): return None, float('inf')
 
     end_lat, end_lng = graph.nodes[end_id]['lat'], graph.nodes[end_id]['lng']
     def heuristic_min(n_id):
@@ -185,11 +166,11 @@ def a_star_on_graph(graph, start_id, end_id, forbidden_nodes=None, forbidden_edg
             return path[::-1], g_score[end_id]
 
         for neighbor in graph.neighbors(current):
-            if is_node_forbidden(neighbor) or is_edge_forbidden(current, neighbor): continue
-            
             edge_time = float(graph[current][neighbor].get('time', 0.0))
+            # Bỏ qua sớm các cạnh bị chặn (time=inf) để không lãng phí heap.
+            if edge_time == float('inf'): continue
+
             tentative_g = g_score[current] + edge_time
-            
             if tentative_g < g_score.get(neighbor, float('inf')):
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_g
@@ -266,17 +247,20 @@ def load_graph_with_coordinates():
     for u, v, d in WALK_GRAPH.edges(data=True):
         if u in COMBINED_BASE_GRAPH and v in COMBINED_BASE_GRAPH:
             dist = float(d.get('length', haversine_distance(COMBINED_BASE_GRAPH.nodes[u]['lat'], COMBINED_BASE_GRAPH.nodes[u]['lng'], COMBINED_BASE_GRAPH.nodes[v]['lat'], COMBINED_BASE_GRAPH.nodes[v]['lng']) * 1000.0))
-            COMBINED_BASE_GRAPH.add_edge(u, v, mode='walk', type='walk', time=meters_to_minutes(dist, WALK_SPEED_KMH), length=dist)
+            t = meters_to_minutes(dist, WALK_SPEED_KMH)
+            COMBINED_BASE_GRAPH.add_edge(u, v, mode='walk', type='walk', time=t, base_time=t, length=dist)
 
     for u, v, d in METRO_GRAPH.edges(data=True):
         if u in COMBINED_BASE_GRAPH and v in COMBINED_BASE_GRAPH:
             dist = float(d.get('length', haversine_distance(COMBINED_BASE_GRAPH.nodes[u]['lat'], COMBINED_BASE_GRAPH.nodes[u]['lng'], COMBINED_BASE_GRAPH.nodes[v]['lat'], COMBINED_BASE_GRAPH.nodes[v]['lng']) * 1000.0))
-            COMBINED_BASE_GRAPH.add_edge(u, v, mode='metro', type='metro', time=meters_to_minutes(dist, METRO_SPEED_KMH), length=dist, geometry_coords=parse_geometry_coords(d.get('geometry_coords')))
+            t = meters_to_minutes(dist, METRO_SPEED_KMH)
+            COMBINED_BASE_GRAPH.add_edge(u, v, mode='metro', type='metro', time=t, base_time=t, length=dist, geometry_coords=parse_geometry_coords(d.get('geometry_coords')))
 
     for s_id, w_id in STATION_TO_WALK_NODE.items():
         if s_id in COMBINED_BASE_GRAPH and w_id in COMBINED_BASE_GRAPH:
             dist = haversine_distance(COMBINED_BASE_GRAPH.nodes[s_id]['lat'], COMBINED_BASE_GRAPH.nodes[s_id]['lng'], COMBINED_BASE_GRAPH.nodes[w_id]['lat'], COMBINED_BASE_GRAPH.nodes[w_id]['lng']) * 1000.0
-            COMBINED_BASE_GRAPH.add_edge(s_id, w_id, mode='walk', type='walk_transfer', time=meters_to_minutes(dist, WALK_SPEED_KMH), length=dist)
+            t = meters_to_minutes(dist, WALK_SPEED_KMH)
+            COMBINED_BASE_GRAPH.add_edge(s_id, w_id, mode='walk', type='walk_transfer', time=t, base_time=t, length=dist)
 
     return True
 
@@ -393,25 +377,72 @@ def find_complete_path(point_a, point_b, forbidden_nodes, forbidden_edges, forbi
 # ============================================================================
 
 class AppState:
-    #Giữ nguyên State Management để đảm bảo logic Admin không bị mất
+    """
+    Quản lý trạng thái cấm. Thay vì để A* kiểm tra runtime, các block sẽ
+    đặt time=inf trực tiếp trên COMBINED_BASE_GRAPH; unblock khôi phục về base_time.
+    Các tập hợp dưới đây vẫn được duy trì cho endpoint /api/graph-data
+    (frontend cần để vẽ marker/vùng đỏ), nhưng không còn ảnh hưởng đến A*.
+    """
     def __init__(self):
         self.forbidden_nodes = set()
-        self.forbidden_edges = set()
+        self.forbidden_edges = set()      # Tập các cặp (u, v) đã được set inf bởi block_edge/block_node
         self.forbidden_edge_routes = []
         self.forbidden_zones = []
-    
-    def block_node(self, node_id): self.forbidden_nodes.add(node_id)
-    def unblock_node(self, node_id): self.forbidden_nodes.discard(node_id)
-    
+
+    # --- Tiện ích nội bộ: thao tác inf-weight trên COMBINED_BASE_GRAPH ---
+    def _set_edge_inf(self, u, v):
+        if COMBINED_BASE_GRAPH is not None and COMBINED_BASE_GRAPH.has_edge(u, v):
+            COMBINED_BASE_GRAPH[u][v]['time'] = float('inf')
+
+    def _restore_edge(self, u, v):
+        if COMBINED_BASE_GRAPH is not None and COMBINED_BASE_GRAPH.has_edge(u, v):
+            base = COMBINED_BASE_GRAPH[u][v].get('base_time')
+            if base is not None:
+                COMBINED_BASE_GRAPH[u][v]['time'] = float(base)
+
+    def _edges_in_zone(self, zone):
+        """Liệt kê các cạnh của COMBINED_BASE_GRAPH bị cắt bởi vùng cấm."""
+        affected = []
+        if COMBINED_BASE_GRAPH is None: return affected
+        for u, v in COMBINED_BASE_GRAPH.edges():
+            if edge_intersects_forbidden_zone(COMBINED_BASE_GRAPH, u, v, [zone]):
+                affected.append((u, v))
+        return affected
+
+    def _is_edge_still_blocked(self, u, v):
+        """Kiểm tra một cạnh có còn bị chặn bởi block khác sau khi unblock một nguồn."""
+        if (u, v) in self.forbidden_edges or (v, u) in self.forbidden_edges: return True
+        if u in self.forbidden_nodes or v in self.forbidden_nodes: return True
+        for z in self.forbidden_zones:
+            if edge_intersects_forbidden_zone(COMBINED_BASE_GRAPH, u, v, [z]): return True
+        return False
+
+    # --- Block / Unblock node ---
+    def block_node(self, node_id):
+        self.forbidden_nodes.add(node_id)
+        if COMBINED_BASE_GRAPH is not None and node_id in COMBINED_BASE_GRAPH:
+            for nb in COMBINED_BASE_GRAPH.neighbors(node_id):
+                self._set_edge_inf(node_id, nb)
+
+    def unblock_node(self, node_id):
+        self.forbidden_nodes.discard(node_id)
+        if COMBINED_BASE_GRAPH is not None and node_id in COMBINED_BASE_GRAPH:
+            for nb in COMBINED_BASE_GRAPH.neighbors(node_id):
+                if not self._is_edge_still_blocked(node_id, nb):
+                    self._restore_edge(node_id, nb)
+
+    # --- Block / Unblock edge ---
     def block_edge(self, node1, node2):
+        # Trường hợp 1: cạnh đi bộ thông thường (không nằm trong METRO_GRAPH)
         if not METRO_GRAPH or node1 not in METRO_GRAPH or node2 not in METRO_GRAPH:
             self.forbidden_edges.update([(node1, node2), (node2, node1)])
-            self.forbidden_nodes.update([node1, node2])
+            self._set_edge_inf(node1, node2)
             return
-            
+
+        # Trường hợp 2: cạnh metro - chặn toàn bộ chuỗi cạnh giữa hai trạm
         try: path = nx.shortest_path(METRO_GRAPH, node1, node2, weight='length')
         except: path = [node1, node2]
-        
+
         # Tái tạo mảng geometry_coords để Frontend vẽ đường màu đỏ nối các ga
         geom_coords = []
         for u, v in zip(path[:-1], path[1:]):
@@ -424,16 +455,17 @@ class AppState:
                 geom_coords.extend(coords)
 
         route = {
-            'start': node1, 
-            'end': node2, 
-            'path': path, 
+            'start': node1,
+            'end': node2,
+            'path': path,
             'segments': [[u, v] for u, v in zip(path[:-1], path[1:])],
-            'geometry_coords': geom_coords # Trả lại key này cho Frontend
+            'geometry_coords': geom_coords
         }
-        
-        for u, v in route['segments']: self.forbidden_edges.update([(u, v), (v, u)])
-        for n in route['path']: self.forbidden_nodes.add(n)
-        
+
+        for u, v in route['segments']:
+            self.forbidden_edges.update([(u, v), (v, u)])
+            self._set_edge_inf(u, v)
+
         self.forbidden_edge_routes = [r for r in self.forbidden_edge_routes if not (r.get('start') in (node1, node2) and r.get('end') in (node1, node2))]
         self.forbidden_edge_routes.append(route)
 
@@ -442,16 +474,20 @@ class AppState:
         for r in self.forbidden_edge_routes:
             if r['start'] in (node1, node2) and r['end'] in (node1, node2): rem_routes.append(r)
             else: keep_routes.append(r)
-        
+
         if rem_routes:
             for r in rem_routes:
-                for u, v in r.get('segments', []): self.forbidden_edges.difference_update([(u, v), (v, u)])
-                for n in r.get('path', []): self.forbidden_nodes.discard(n)
+                for u, v in r.get('segments', []):
+                    self.forbidden_edges.difference_update([(u, v), (v, u)])
+                    if not self._is_edge_still_blocked(u, v):
+                        self._restore_edge(u, v)
         else:
             self.forbidden_edges.difference_update([(node1, node2), (node2, node1)])
-            self.forbidden_nodes.difference_update([node1, node2])
+            if not self._is_edge_still_blocked(node1, node2):
+                self._restore_edge(node1, node2)
         self.forbidden_edge_routes = keep_routes
 
+    # --- Block / Unblock zone ---
     def block_zone(self, center_lat, center_lng, radius, boundary_lat=None, boundary_lng=None):
         zone = {'center_lat': float(center_lat), 'center_lng': float(center_lng), 'radius': radius}
         if boundary_lat is not None and boundary_lng is not None:
@@ -460,14 +496,60 @@ class AppState:
             try: zone['radius_m'] = float(radius) * 111000.0
             except: zone['radius_m'] = 0.0
         self.forbidden_zones.append(zone)
+        # Đặt inf cho tất cả cạnh bị vùng cấm cắt qua
+        for u, v in self._edges_in_zone(zone):
+            self._set_edge_inf(u, v)
 
     def unblock_zone(self, center_lat, center_lng, radius):
-        self.forbidden_zones = [z for z in self.forbidden_zones if not (abs(z['center_lat'] - center_lat) < 1e-6 and abs(z['center_lng'] - center_lng) < 1e-6 and abs(z.get('radius', 0.0) - radius) < 1e-6)]
-    
-    def reset_all(self): self.__init__()
-    def reset_nodes(self): self.forbidden_nodes = set()
-    def reset_edges(self): self.forbidden_edges, self.forbidden_edge_routes = set(), []
-    def reset_zones(self): self.forbidden_zones = []
+        removed = [z for z in self.forbidden_zones if (abs(z['center_lat'] - center_lat) < 1e-6 and abs(z['center_lng'] - center_lng) < 1e-6 and abs(z.get('radius', 0.0) - radius) < 1e-6)]
+        self.forbidden_zones = [z for z in self.forbidden_zones if z not in removed]
+        # Với mỗi cạnh từng bị vùng này chặn, kiểm tra còn nguồn block nào khác không
+        for zone in removed:
+            for u, v in self._edges_in_zone(zone):
+                if not self._is_edge_still_blocked(u, v):
+                    self._restore_edge(u, v)
+
+    # --- Reset ---
+    def _restore_all_edges(self):
+        if COMBINED_BASE_GRAPH is None: return
+        for u, v, d in COMBINED_BASE_GRAPH.edges(data=True):
+            base = d.get('base_time')
+            if base is not None: d['time'] = float(base)
+
+    def _reapply_all_blocks(self):
+        """Sau khi clear một phạm vi, áp lại các block còn lại lên trọng số."""
+        if COMBINED_BASE_GRAPH is None: return
+        for n in self.forbidden_nodes:
+            if n in COMBINED_BASE_GRAPH:
+                for nb in COMBINED_BASE_GRAPH.neighbors(n):
+                    self._set_edge_inf(n, nb)
+        for u, v in self.forbidden_edges:
+            self._set_edge_inf(u, v)
+        for z in self.forbidden_zones:
+            for u, v in self._edges_in_zone(z):
+                self._set_edge_inf(u, v)
+
+    def reset_all(self):
+        self.forbidden_nodes = set()
+        self.forbidden_edges = set()
+        self.forbidden_edge_routes = []
+        self.forbidden_zones = []
+        self._restore_all_edges()
+
+    def reset_nodes(self):
+        self.forbidden_nodes = set()
+        self._restore_all_edges()
+        self._reapply_all_blocks()
+
+    def reset_edges(self):
+        self.forbidden_edges, self.forbidden_edge_routes = set(), []
+        self._restore_all_edges()
+        self._reapply_all_blocks()
+
+    def reset_zones(self):
+        self.forbidden_zones = []
+        self._restore_all_edges()
+        self._reapply_all_blocks()
 
 app_state = AppState()
 
