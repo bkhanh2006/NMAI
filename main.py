@@ -13,6 +13,8 @@ import heapq
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import networkx as nx
+from shapely.geometry import shape, Point
+from shapely.strtree import STRtree
 from pyproj import Transformer
 try:
     from scipy.spatial import cKDTree
@@ -37,6 +39,10 @@ WALK_KDTREE = None
 WALK_COORD_BY_ID = {}
 STATION_TO_WALK_NODE = {}
 COMBINED_BASE_GRAPH = None
+WATER_POLYGONS = []     
+WATER_STRTREE = None    
+WATER_GEOJSON_PATH = 'graph/water_polygons.geojson'
+KDTREE_FALLBACK_THRESHOLD_M = 1000.0  
 
 WALK_SPEED_KMH = 4.8
 METRO_SPEED_KMH = 36.0
@@ -56,6 +62,62 @@ ST_PETERSBURG_BBOX = {
 def is_in_st_petersburg(lat, lng):
     return (ST_PETERSBURG_BBOX['min_lat'] <= float(lat) <= ST_PETERSBURG_BBOX['max_lat']) and \
            (ST_PETERSBURG_BBOX['min_lng'] <= float(lng) <= ST_PETERSBURG_BBOX['max_lng'])
+
+# Tải file GeoJSON chứa các polygon vùng nước (sông, biển, kênh) 
+def load_water_polygons():
+    global WATER_POLYGONS, WATER_STRTREE
+    
+    if not os.path.exists(WATER_GEOJSON_PATH):
+        print(f"[!] Water polygon file not found at {WATER_GEOJSON_PATH}. "
+              f"Falling back to KDTree-only validation.")
+        return False
+    
+    try:
+        with open(WATER_GEOJSON_PATH, 'r', encoding='utf-8') as f:
+            geojson = json.load(f)
+        
+        polygons = []
+        for feature in geojson.get('features', []):
+            geom = feature.get('geometry')
+            if not geom:
+                continue
+            try:
+                shp = shape(geom)
+                if shp.geom_type == 'Polygon':
+                    polygons.append(shp)
+                elif shp.geom_type == 'MultiPolygon':
+                    polygons.extend(shp.geoms)
+            except Exception:
+                continue
+        
+        if not polygons:
+            print("[!] No valid water polygons loaded.")
+            return False
+        
+        WATER_POLYGONS = polygons
+        WATER_STRTREE = STRtree(polygons)
+        print(f"[✓] Loaded {len(polygons)} water polygons into spatial index.")
+        return True
+        
+    except Exception as e:
+        print(f"[!] Failed to load water polygons: {e}")
+        return False
+
+
+# Kiểm tra xem một tọa độ (lat, lng) có nằm trong vùng nước hay không.
+def is_point_on_water(lat, lng):
+    if WATER_STRTREE is None:
+        return False  # Không có index, không thể xác định -> coi như đất
+    
+    point = Point(float(lng), float(lat))
+    
+    candidate_indices = WATER_STRTREE.query(point)
+    
+    for idx in candidate_indices:
+        if WATER_POLYGONS[idx].contains(point):
+            return True
+    
+    return False
 
 # Hàm tính khoảng cách Haversine giữa hai điểm địa lý, được sử dụng làm heuristic trong thuật toán A*.
 def haversine_distance(lat1, lng1, lat2, lng2):
@@ -584,19 +646,35 @@ def validate_point():
     
     if lat is None or lng is None:
         return jsonify({'error': 'Missing coordinates'}), 400
-
+    
+    # Bước 1: Kiểm tra bounding box thành phố (lọc sớm)
     if not is_in_st_petersburg(lat, lng):
         return jsonify({'error': 'Tọa độ không hợp lệ, ngoài thành phố St. Petersburg'}), 400
-
+    
+    # Bước 2: Kiểm tra Point-in-Polygon trên vùng nước (kiểm tra chính)
+    # Đây là nguồn xác thực chính: nếu điểm nằm trong sông/biển/kênh -> từ chối.
+    if is_point_on_water(lat, lng):
+        return jsonify({
+            'error': 'Không thể chọn điểm trên mặt nước'
+                     'Vui lòng chọn một điểm trên đất liền.'
+        }), 400
+    
+    # Bước 3: Dự phòng KDTree với ngưỡng nới lỏng
+    # Bắt các trường hợp đất liền nhưng quá xa mạng lưới đường (ví dụ: giữa rừng,
+    # khu công nghiệp chưa có path). 
     if WALK_KDTREE:
         _, idx = WALK_KDTREE.query((lng, lat), k=1)
         node_id = WALK_NODE_IDS[int(idx)]
         node_coord = WALK_COORD_BY_ID[node_id]
         dist_m = haversine_distance(lat, lng, node_coord[0], node_coord[1]) * 1000
-
-        if dist_m > 500:
-            return jsonify({'error': 'Khu vực không thể di chuyển tới (cách điểm đi bộ gần nhất > 500m). Các vùng trên biển, sông hồ hoặc quá xa đường xá không thể chọn.'}), 400
-            
+        
+        if dist_m > KDTREE_FALLBACK_THRESHOLD_M:
+            return jsonify({
+                'error': f'Khu vực này quá xa mạng lưới đường đi bộ '
+                         f'(cách điểm gần nhất {int(dist_m)}m). '
+                         f'Vui lòng chọn điểm gần đường phố hơn.'
+            }), 400
+    
     return jsonify({'success': True}), 200
 
 @app.route('/api/find-path', methods=['POST'])
@@ -689,5 +767,7 @@ def reset_state():
 if __name__ == '__main__':
     print("[*] Loading St. Petersburg Metro graph...")
     load_graph_with_coordinates()
+    print("[*] Loading water polygons spatial index...")
+    load_water_polygons()
     print(f"[✓] Starting Flask server on http://localhost:5000")
     app.run(debug=False, host='0.0.0.0', port=5000)
