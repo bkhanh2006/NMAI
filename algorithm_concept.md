@@ -19,8 +19,45 @@ Dự án vận hành trên biến thể cơ bản nhưng tối giản tối ưu 
 Trong quá trình vòng lặp mở của thuật toán A* phân trần đỉnh tiếp cận lân cận, bộ kiểm tra (validation) trực tiếp chặn đứng những phương án sau:
 - **Cấm Ga (Forbidden Nodes):** Kiểm tra xem ga metro có lọt vào mảng cách ly orbidden_nodes.
 - **Cấm Cạnh (Forbidden Edges):** Tránh những đường tiếp cận cầu nối (u, v) trực tiếp vướng rào cản.
-- **Cấm Khu Vực Rộng (Forbidden Zones):** Hệ thống xét tọa độ tâm và bán kính adius_m: 
+- **Cấm Khu Vực Rộng (Forbidden Zones):** Hệ thống xét tọa độ tâm và bán kính 
+adius_m: 
   - Toàn bộ Điểm đi bộ và Ga đếm khoảng cách có nhỏ hơn mức bán kính quy quét bị đánh rớt.
   - Các đoạn Cạnh đường (Edge) sẽ bị tính theo phép chiếu điểm hình học Euclid (geometric Euclidean projection) từ tâm vào đoạn nối để chặn nếu đường ấy đâm xuyên qua vùng nguy hiểm. 
 
 Thuật toán của tự động linh hoạt rẽ đi nhánh tối ưu tiếp theo nhờ nguyên lý loại trừ này rỗng mà không cần phải compile lại source code.
+
+## 5. Phân rã Kiến trúc & Luồng xử lý chi tiết
+
+### 5.1. `main.py` (Trái tim của hệ thống định tuyến)
+**Ý tưởng:** 
+Đây là máy chủ backend (API server) thực hiện nhiệm vụ thiết lập bản đồ tổng và tìm đường đi (Routing). Nó hợp nhất bản đồ mặt đất (đi bộ) và bản đồ ngầm (tàu điện) thành một mạng lưới xuyên suốt. Dựa theo truy vấn của người dùng, nó sử dụng thuật toán trí tuệ nhân tạo (A* Search) tìm ra lộ trình tiêu tốn "Ít thời gian nhất", đồng thời có khả năng "né" các khu vực hoặc nhà ga bị đánh dấu cấm một cách tự động.
+
+**Các bước thực hiện:**
+1. **Nạp và Hợp nhất Đồ thị (Graph Loading & Merging):** Tải file đồ thị đi bộ (`spd_walk.graphml`) và tàu điện (`spd_metro.graphml`). Sử dụng cấu trúc dữ liệu không gian KD-Tree để tìm các điểm đi bộ trên phố nằm gần các nhà ga nhất. Cuối cùng, tạo ra các "cạnh chuyển tiếp" (thang máy/lối xuống) để nối đồ thị đi bộ và đồ thị metro tạo thành một hệ thống liên lạc duy nhất (`COMBINED_BASE_GRAPH`).
+2. **Khởi tạo Truy vấn (Tạo Nút A và B):** Khi người dùng chọn 2 tọa độ bất kỳ làm điểm đi và đến, hệ thống dùng KD-Tree để chiếu tọa độ đó vào 6 điểm đi bộ gần nhất trên mạng lưới thực tế, gán tên là điểm `__point_a__` và `__point_b__`.
+3. **Tiến hành tìm đường bằng Thuật toán A*:** 
+   - **G-score (Chi phí thực tế):** Tính bằng Khoảng cách (km) chia cho Vận tốc (4.8km/h đối với đi bộ, 36km/h đối với tàu). 
+   - **H-score (Heuristic):** Tính khoảng cách chim bay (Haversine Distance) từ điểm đang xét thẳng đến đích.
+4. **Cơ chế kiểm soát vùng cấm (Admin Blocks):** Trong quá trình đồ thị duyệt các nút lân cận, nếu nút (hoặc đường cắt qua) nằm trong danh sách cấm hoặc "vùng nguy hiểm" (tính toán bằng hình học chiếu Euclidean), thuật toán sẽ thẳng tay loại trừ và tự động bẻ nhánh, tìm con đường tối ưu thứ hai tiếp theo để lách qua.
+
+### 5.2. `build_metro.py` (Xây dựng đồ thị Tàu điện ngầm)
+**Ý tưởng:** 
+Khai thác dữ liệu hệ thống Tàu điện ngầm của St. Petersburg từ bản đồ mã nguồn mở để tạo ra một biểu đồ mạng lưới (nodes và edges), đo lường quãng đường giữa các bến nhằm phục vụ việc chạy thuật toán ở `main.py`.
+
+**Các bước thực hiện:**
+1. **Truy xuất dữ liệu:** Tải về các điểm là nhà ga (chứa thẻ `station: subway`) và các đường ray hầm nối (chứa thẻ `railway: subway`) từ thư viện OpenStreetMap (khu vực Sankt-Peterburg). Bỏ qua các tuyến tàu đang xây hoặc bỏ hoang.
+2. **Xử lý Nhà ga (Nodes):** Tính toán điểm trung tâm (centroid) của toàn bộ khuôn viên nhà ga để lấy kinh độ/vĩ độ chính xác, đồng thời áp dụng lưới lọc chặn những nhà ga sai lệch hoặc không được phép sử dụng. Những nhà ga này trở thành các "Đỉnh" của đồ thị.
+3. **Liên kết tuyến đường (Edges):** Nối các đoạn ray gãy khúc lại thành một tuyến ray liền mạch. Rà dọc theo tuyến ray để xem các nhà ga nào gần đường ray dưới 250m, thiết lập thuật toán gộp những ga của cùng một trạm chuyển tuyến nằm quá sát nhau thành một điểm (bằng hệ số chiếu nhóm 350m). Cuối cùng nối chúng lại theo thứ tự để tạo ra các "Cạnh" mạng lưới và gán vận tốc tiêu chuẩn cho Tàu điện.
+4. **Đóng gói file:** Lưu đồ thị hoàn thiện xuất dưới định dạng `spd_metro.graphml`.
+
+### 5.3. `build_walk.py` (Xây dựng đồ thị Đi bộ mặt đất)
+**Ý tưởng:** 
+Rút trích các khung đường bộ, vỉa hè dành cho người đi bộ của toàn bộ thành phố. Sau đó "tinh gọn" hóa nó để không làm nặng hệ thống thuật toán, nhưng vẫn phải đảm bảo chuẩn định dạng để tích hợp tương thích hoàn toàn với file `main.py`.
+
+**Các bước thực hiện:**
+1. **Truy xuất dữ liệu:** Download toàn bộ mạng lưới bộ hành OpenStreetMap thông qua module OSMnx.
+2. **Tinh chỉnh không gian & Giảm tải (Pruning & Consolidation):** Lưới đường bộ có rất nhiều nút bị trùng lặp tại giao lộ, hệ thống hợp nhất chúng trong sai số 15 mét vào làm 1. Nếu có hai lối đi song song nối giữa hai trạm, tự động xóa lối dài hơn và chỉ giữ bản gốc ngắn nhất. Xóa toàn bộ metadata thừa (tên đường, số làn, ánh sáng, độ dốc...) để file đồ thị nhẹ đi nhiều lần.
+3. **Chuẩn hóa Thông số:** Chi phí trọng số trên mỗi con đường được gán dựa trên vận tốc đi bộ.
+4. **Phòng ngừa Xung đột ID:** Thêm tiền tố `"w_"` (nghĩa là walk) vào ID của toàn bộ các điểm giao đi bộ. Bước này cốt yếu để khi `main.py` chập hai đồ thị lại, các ID ga Tàu điện ngầm (dạng số) không bị trùng đè lên các ID gốc của lưới đường bộ, tránh làm đứt rãy mạng lưới.
+5. **Đóng gói file:** Xuất đồ thị hoàn thiện ra file `spd_walk.graphml`.
+

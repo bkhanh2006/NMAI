@@ -20,7 +20,7 @@ except Exception:
     cKDTree = None
 
 # ============================================================================
-# INITIALIZATION & GLOBALS
+# KHỞI TẠO VÀ CÁC BIẾN TOÀN CỤC
 # ============================================================================
 
 app = Flask(__name__)
@@ -49,16 +49,16 @@ ST_PETERSBURG_BBOX = {
 }
 
 # ============================================================================
-# UTILITIES - HEURISTIC & DISTANCE
+# TIỆN ÍCH - HEURISTIC VÀ KHOẢNG CÁCH
 # ============================================================================
 
+# Hàm kiểm tra xem tọa độ có nằm trong khu vực St. Petersburg hay không, giúp lọc sớm các yêu cầu không hợp lệ.
 def is_in_st_petersburg(lat, lng):
-    """Kiểm tra xem tọa độ có nằm trong giới hạn St. Petersburg không"""
     return (ST_PETERSBURG_BBOX['min_lat'] <= float(lat) <= ST_PETERSBURG_BBOX['max_lat']) and \
            (ST_PETERSBURG_BBOX['min_lng'] <= float(lng) <= ST_PETERSBURG_BBOX['max_lng'])
 
+# Hàm tính khoảng cách Haversine giữa hai điểm địa lý, được sử dụng làm heuristic trong thuật toán A*.
 def haversine_distance(lat1, lng1, lat2, lng2):
-    """Tính khoảng cách Haversine chuẩn (km) cho tọa độ cầu"""
     R = 6371.0 
     lat1, lng1, lat2, lng2 = map(radians, [lat1, lng1, lat2, lng2])
     dlat = lat2 - lat1
@@ -67,10 +67,12 @@ def haversine_distance(lat1, lng1, lat2, lng2):
     c = 2 * atan2(sqrt(a), sqrt(1-a))
     return R * c
 
+# Quy đổi khoảng cách (theo đơn vị mét) sang thời gian di chuyển (theo đơn vị phút)
 def meters_to_minutes(distance_m, speed_kmh):
     if speed_kmh <= 0: return 0.0
     return (distance_m / 1000.0) / speed_kmh * 60.0
 
+# Trích xuất và kiểm tra tính hợp lệ danh sách các điểm tọa độ từ dữ liệu JSON/String.
 def parse_geometry_coords(value):
     if not value: return []
     parsed = value
@@ -87,6 +89,7 @@ def parse_geometry_coords(value):
             if abs(lat) <= 90 and abs(lng) <= 180: coords.append([lat, lng])
     return coords
 
+# Hàm kiểm tra xem một cạnh có cắt qua bất kỳ vùng cấm nào không, bằng cách chiếu điểm gần nhất từ tâm vùng cấm lên đoạn thẳng của cạnh.
 def edge_intersects_forbidden_zone(graph, u, v, forbidden_zones):
     """Tối ưu hóa: Thuật toán chiếu điểm lên đoạn thẳng để tìm khoảng cách ngắn nhất đến tâm vùng cấm"""
     if not forbidden_zones: return False
@@ -126,15 +129,17 @@ def edge_intersects_forbidden_zone(graph, u, v, forbidden_zones):
             if dist_m <= radius_m: return True
     return False
 
+# Hàm trích xuất tên hiển thị của một node, ưu tiên trường 'name' nếu có, nếu không sẽ trả về ID của node đó.
 def node_name(node_id, node_data):
     if node_id in ('__point_a__', '__point_b__'): return 'Điểm A' if node_id == '__point_a__' else 'Điểm B'
     return node_data.get('name') or node_id
 
+# Hàm xác định phương tiện di chuyển (phương thức vận chuyển) của một cạnh dựa vào thuộc tính 'mode' hoặc 'type', mặc định trả về 'walk' nếu không có thông tin.
 def get_edge_mode(edge_data):
     return str(edge_data.get('mode', edge_data.get('type', 'walk'))).lower()
 
 # ============================================================================
-# A* PATHFINDING ALGORITHM
+# THUẬT TOÁN TÌM ĐƯỜNG A*
 # ============================================================================
 
 def a_star_on_graph(graph, start_id, end_id, forbidden_nodes=None, forbidden_edges=None, forbidden_zones=None):
@@ -194,9 +199,12 @@ def a_star_on_graph(graph, start_id, end_id, forbidden_nodes=None, forbidden_edg
     return None, float('inf')
 
 # ============================================================================
-# GRAPH LOADING & ROUTE BUILDING
+# TẢI ĐỒ THỊ VÀ XÂY DỰNG TUYẾN ĐƯỜNG
 # ============================================================================
 
+# Hàm load dữ liệu đồ thị từ 2 files graphml (metro và đường đi bộ).
+# Đồng thời liên kết các ga metro gần với các đường đi bộ, sau đó tạo
+# thành MỘT đồ thị tổ hợp DUY NHẤT để A* tính toán dễ dàng.
 def load_graph_with_coordinates():
     global NODES_DICT, EDGES_LIST, WALK_GRAPH, METRO_GRAPH, WALK_NODE_IDS, WALK_NODE_COORDS
     global WALK_NODES_API, WALK_KDTREE, WALK_COORD_BY_ID, STATION_TO_WALK_NODE, COMBINED_BASE_GRAPH
@@ -214,7 +222,7 @@ def load_graph_with_coordinates():
         if -180 <= x <= 180 and -90 <= y <= 90: return y, x
         return utm36_to_wgs84.transform(x, y)[::-1] # return lat, lon
 
-    # 1. Parse Metro
+    # 1. Phân tích dữ liệu Metro
     for node_id, data in METRO_GRAPH.nodes(data=True):
         lat, lng = norm_coords(data.get('x', 0), data.get('y', 0), data.get('lat'), data.get('lng'))
         NODES_DICT[node_id] = {
@@ -230,7 +238,7 @@ def load_graph_with_coordinates():
         if v not in NODES_DICT[u]['connections']: NODES_DICT[u]['connections'].append(v)
         if u not in NODES_DICT[v]['connections']: NODES_DICT[v]['connections'].append(u)
 
-    # 2. Parse Walk
+    # 2. Phân tích dữ liệu Đi bộ
     for node_id, data in WALK_GRAPH.nodes(data=True):
         lat, lng = norm_coords(data.get('x', 0), data.get('y', 0))
         WALK_NODE_IDS.append(node_id)
@@ -240,14 +248,14 @@ def load_graph_with_coordinates():
 
     if cKDTree: WALK_KDTREE = cKDTree([(lng, lat) for lat, lng in WALK_NODE_COORDS])
 
-    # 3. Link Stations to Walk Nodes
+    # 3. Liên kết các Trạm với các Nút Đi bộ
     for s_id, s_data in NODES_DICT.items():
         if s_data.get('type') != 'station': continue
         if WALK_KDTREE:
             _, idx = WALK_KDTREE.query((s_data['lng'], s_data['lat']), k=1)
             STATION_TO_WALK_NODE[s_id] = WALK_NODE_IDS[int(idx)]
 
-    # 4. Build Combined Graph
+    # 4. Xây dựng Đồ thị Kết hợp
     COMBINED_BASE_GRAPH = nx.Graph()
     for n_id, data in NODES_DICT.items():
         COMBINED_BASE_GRAPH.add_node(n_id, id=n_id, lat=data['lat'], lng=data['lng'], name=data['name'], type=data['type'])
@@ -272,14 +280,16 @@ def load_graph_with_coordinates():
 
     return True
 
+# Kiểm tra và đảo ngược danh sách các toạ độ nếu điểm đầu cấu trúc hình học không phải điểm gần cấu trúc được truyền. Giúp hiển thị lộ trình vẽ liền mạch trên bản đồ.
 def orient_edge_coords(coords, start_lat, start_lng):
     if not coords: return []
     if (coords[-1][0] - start_lat)**2 + (coords[-1][1] - start_lng)**2 < (coords[0][0] - start_lat)**2 + (coords[0][1] - start_lng)**2:
         return list(reversed(coords))
     return coords
 
+# Giữ nguyên logic chia chặng gốc của Frontend.
+# Phân tích một chuỗi các nodes kết quả do A* trả về thành các đoạn hành trình nhằm dễ dàng visualize cho frontend.
 def build_route_segments(graph, path):
-    """Giữ nguyên logic chia chặng gốc của Frontend"""
     segments = []
     if not path or len(path) < 2: return segments
     current = None
@@ -310,8 +320,8 @@ def build_route_segments(graph, path):
 
     return segments
 
+# Chuyển đổi từng segment lớn thành các "chỉ dẫn đường đi - steps" cặn kẽ hơn để ứng dụng front-end in ra danh sách text cho người dùng đọc.
 def build_detailed_steps(graph, segments):
-    """Giữ nguyên định dạng trả về Step cho UI"""
     steps = []
     for idx, seg in enumerate(segments, start=1):
         if seg['mode'] == 'metro' and len(seg['node_ids']) > 2:
@@ -331,10 +341,11 @@ def build_detailed_steps(graph, segments):
             })
     return steps
 
+# Hàm tổng hợp ghép điểm Khởi điểm (A) và điểm Đích (B) vào đồ thị tổ hợp tạm thời (tương thích cho A*). Tạo các "cạnh tiếp cận" tới tuyến đường đi bộ lân cận nhất rồi gọi A* xử lý, sau cùng kết xuất chi tiết hành trình.
 def find_complete_path(point_a, point_b, forbidden_nodes, forbidden_edges, forbidden_zones):
     if not COMBINED_BASE_GRAPH: return None
 
-    # Check start/end against forbidden zones
+    # Kiểm tra điểm bắt đầu/kết thúc so với các khu vực bị cấm
     for zone in forbidden_zones:
         rm = float(zone.get('radius_m', 0))
         if haversine_distance(point_a['lat'], point_a['lng'], zone['center_lat'], zone['center_lng']) * 1000 <= rm: return None
@@ -378,11 +389,11 @@ def find_complete_path(point_a, point_b, forbidden_nodes, forbidden_edges, forbi
     }
 
 # ============================================================================
-# STATE MANAGEMENT
+# QUẢN LÝ TRẠNG THÁI
 # ============================================================================
 
 class AppState:
-    """Giữ nguyên State Management để đảm bảo logic Admin không bị mất"""
+    #Giữ nguyên State Management để đảm bảo logic Admin không bị mất
     def __init__(self):
         self.forbidden_nodes = set()
         self.forbidden_edges = set()

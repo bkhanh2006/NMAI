@@ -1,33 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-build_walk.py
-Build an optimized pedestrian network for Saint Petersburg, Russia
-and export it to graph/spd_walk.graphml in a format that is fully
-compatible with the existing main.py routing logic.
-
-Convention (must match main.py):
-    node attribute 'x' = longitude (WGS84)
-    node attribute 'y' = latitude  (WGS84)
-    'lat' / 'lng' are also written explicitly for backward compatibility.
-
-Pipeline:
-  1. Download OSM walk network for Saint Petersburg.
-  2. Consolidate intersections (15 m tolerance) to merge duplicate nodes.
-  3. Prune any node whose coordinates leak out of WGS84 range.
-  4. Collapse parallel edges between the same pair of nodes (keep the
-     shortest one) while preserving the MultiGraph / MultiDiGraph type.
-  5. Assign walking time and clean unused OSM metadata.
-  6. Align coordinates so x=lng, y=lat, plus explicit lat/lng.
-  7. Namespace every node ID with a "w_" prefix so that walk node IDs
-     can never collide with the integer-string IDs that build_metro.py
-     assigns to metro stations. Without this step, main.py silently
-     drops every walk node whose ID matches a station ID, leaving the
-     metro disconnected from the walk graph and forcing A* to walk
-     everywhere.
-  8. Save as GraphML.
-"""
-
 import math
 import os
 
@@ -36,21 +6,18 @@ import osmnx as ox
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# 1. CẤU HÌNH & HÀM HỖ TRỢ
 # ---------------------------------------------------------------------------
 
 PLACE_NAME = "Saint Petersburg, Russia"
 OUT_WALK = r"C:\Users\LENOVO\Documents\GitHub\NMAI\graph\spd_walk.graphml"
 
-# Walking speed in metres per minute. 5000 m / 60 min == 5 km/h.
 WALK_SPEED_M_PER_MIN = 5000.0 / 60.0
 
-# Namespace prefix applied to every walk node ID right before saving.
-# This guarantees no collisions with the small-integer-string IDs used
-# by build_metro.py (e.g. "0", "1", ..., "80") for metro stations.
+# Tiền tố áp dụng cho mọi ID để tránh trùng lặp mới metro 
 WALK_NODE_PREFIX = "w_"
 
-# OSM tags that bloat the file size but are not used by main.py.
+# Các thẻ OSM làm tăng kích thước file nhưng không được main.py sử dụng.
 EDGE_TAGS_TO_DROP = (
     "osmid", "name", "ref", "highway", "maxspeed", "service", "access",
     "area", "landuse", "width", "est_width", "lanes", "bridge", "tunnel",
@@ -61,22 +28,16 @@ NODE_TAGS_TO_DROP = (
     "osmid", "osmid_original", "highway", "ref", "street_count", "junction",
 )
 
-
-# ---------------------------------------------------------------------------
-# OSMnx settings
-# ---------------------------------------------------------------------------
-
 ox.settings.use_cache = True
 ox.settings.log_console = True
 ox.settings.timeout = 300
 
 
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
 
+# Các hàm hỗ trợ
+
+# Hàm tính khoảng cách Haversine giữa 2 điểm WGS84, trả về mét
 def _haversine_m(lat1, lng1, lat2, lng2):
-    """Great-circle distance between two WGS84 points, in metres."""
     r = 6371000.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dp = math.radians(lat2 - lat1)
@@ -84,22 +45,11 @@ def _haversine_m(lat1, lng1, lat2, lng2):
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-
+# Hàm gộp các cạnh song song giữa cùng 2 nút, giữ lại cạnh có độ dài nhỏ nhất
 def _collapse_parallel_edges(graph):
-    """
-    Return a copy of `graph` in which, for every unordered pair of nodes
-    (u, v), at most one edge survives -- the one with the smallest length.
-
-    The returned graph keeps the SAME class as the input (MultiGraph /
-    MultiDiGraph). OSMnx helpers require a Multi* graph, so we must NOT
-    downgrade to nx.Graph here.
-    """
     g = graph.copy()
 
-    # Cast node IDs to strings before sorting; without it, mixed int/str
-    # node IDs raise:
-    #     TypeError: '<' not supported between instances of 'str' and 'int'
-    best_edge_per_pair = {}     # pair -> (length, u, v, key)
+    best_edge_per_pair = {}     
     edges_to_remove = []
 
     for u, v, k, data in g.edges(keys=True, data=True):
@@ -123,9 +73,8 @@ def _collapse_parallel_edges(graph):
 
     return g
 
-
+#Hàm loại bỏ các thẻ không cần thiết khỏi dữ liệu đồ thị, giúp giảm kích thước file khi lưu dưới dạng GraphML.
 def _drop_tags(graph):
-    """Remove unused OSM metadata to keep the GraphML compact."""
     for _, data in graph.nodes(data=True):
         for tag in NODE_TAGS_TO_DROP:
             data.pop(tag, None)
@@ -139,13 +88,8 @@ def _drop_tags(graph):
             for tag in EDGE_TAGS_TO_DROP:
                 data.pop(tag, None)
 
-
+#Ép kiểu các thuộc tính dạng mảng/danh sách thành string để tương thích với GraphML
 def _stringify_attr_values(graph):
-    """
-    GraphML can only serialize scalar attribute values. Convert any
-    list / dict / tuple / set values to their str() so save_graphml does
-    not crash on edges that still carry e.g. OSM `osmid` lists.
-    """
     for _, data in graph.nodes(data=True):
         for key, val in list(data.items()):
             if isinstance(val, (list, dict, tuple, set)):
@@ -162,14 +106,8 @@ def _stringify_attr_values(graph):
                 if isinstance(val, (list, dict, tuple, set)):
                     data[key] = str(val)
 
-
+#Xóa bỏ các nút có tọa độ lỗi hoặc chưa chuyển đổi về hệ kinh-vĩ độ [-180, 180], [-90, 90] để tránh làm sai lệch thuật toán tìm kiếm không gian (KD-Tree).
 def _prune_invalid_wgs84_nodes(graph):
-    """
-    Drop any node whose `x` is not in [-180, 180] or whose `y` is not in
-    [-90, 90]. This guards against stale UTM coordinates that occasionally
-    survive `consolidate_intersections(..., rebuild_graph=True)` and that
-    would otherwise poison main.py's WALK_KDTREE.
-    """
     bad = []
     for node_id, data in graph.nodes(data=True):
         try:
@@ -187,22 +125,14 @@ def _prune_invalid_wgs84_nodes(graph):
 
     return len(bad)
 
-
+# Hàm thêm namespace vào ID node để tránh trùng lặp với build_metro.py
 def _namespace_node_ids(graph, prefix=WALK_NODE_PREFIX):
-    """
-    Relabel every node `n` to `f"{prefix}{n}"`. This is what eliminates
-    the collision between walk node IDs (small integers from OSMnx after
-    consolidation) and metro station IDs (small integer strings from
-    build_metro.py's `str(idx)`). After this step it is impossible for
-    main.py's combined graph to mix a station with a walk intersection
-    just because they happen to share an ID like "12".
-    """
     mapping = {n: f"{prefix}{n}" for n in graph.nodes}
     return nx.relabel_nodes(graph, mapping, copy=True)
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline
+# 2. XÂY DỰNG ĐỒ THỊ ĐI BỘ
 # ---------------------------------------------------------------------------
 
 def main():
@@ -216,7 +146,7 @@ def main():
     print(f"    raw nodes={g_walk.number_of_nodes()}  edges={g_walk.number_of_edges()}")
 
     # -----------------------------------------------------------------------
-    # Step 1: consolidate intersections to merge near-duplicate junctions.
+    # Bước 1: củng cố các ngã tư để gộp các nút giao gần như trùng lặp.
     # -----------------------------------------------------------------------
     print("--- Consolidating intersections (tolerance=15 m) ---")
     g_proj = ox.project_graph(g_walk)
@@ -230,14 +160,14 @@ def main():
     print(f"    after consolidation nodes={g_walk.number_of_nodes()}  edges={g_walk.number_of_edges()}")
 
     # -----------------------------------------------------------------------
-    # Step 2: prune any node whose coordinates are not valid WGS84.
+    # Bước 2: loại bỏ bất kỳ node nào có tọa độ không hợp lệ theo chuẩn WGS84.
     # -----------------------------------------------------------------------
     n_bad = _prune_invalid_wgs84_nodes(g_walk)
     if n_bad:
         print(f"    pruned {n_bad} node(s) with invalid WGS84 coordinates")
 
     # -----------------------------------------------------------------------
-    # Step 3: re-fill any missing/zero `length` from haversine.
+    # Bước 3: điền lại bất kỳ 'length' nào bị thiếu/bằng 0 từ công thức haversine.
     # -----------------------------------------------------------------------
     for u, v, _, data in g_walk.edges(keys=True, data=True):
         if "length" not in data or float(data.get("length", 0) or 0) <= 0:
@@ -249,7 +179,7 @@ def main():
                 data["length"] = 0.0
 
     # -----------------------------------------------------------------------
-    # Step 4: collapse parallel edges (keeps Multi* type).
+    # Bước 4: thu gọn các cạnh song song (giữ loại đồ thị Multi*).
     # -----------------------------------------------------------------------
     print("--- Collapsing parallel edges ---")
     before = g_walk.number_of_edges()
@@ -257,7 +187,7 @@ def main():
     print(f"    removed {before - g_walk.number_of_edges()} parallel edge(s)")
 
     # -----------------------------------------------------------------------
-    # Step 5: assign walking time, node/edge types, drop unused tags.
+    # Bước 5: gán thời gian đi bộ, loại node/cạnh, xóa các thẻ không sử dụng.
     # -----------------------------------------------------------------------
     print("--- Assigning walk weights and cleaning metadata ---")
     if g_walk.is_multigraph():
@@ -282,7 +212,7 @@ def main():
     _drop_tags(g_walk)
 
     # -----------------------------------------------------------------------
-    # Step 6: explicit coordinate alignment for main.py compatibility.
+    # Bước 6: căn chỉnh tọa độ rõ ràng để tương thích với main.py (x=lng, y=lat).
     # -----------------------------------------------------------------------
     print("--- Aligning coordinates (x=lng, y=lat, plus lat/lng) ---")
     for _, data in g_walk.nodes(data=True):
@@ -298,14 +228,14 @@ def main():
         data["lng"] = float(lng)
 
     # -----------------------------------------------------------------------
-    # Step 7: namespace every walk node ID so it cannot collide with the
-    # integer-string station IDs assigned by build_metro.py.
+    # Bước 7: thêm namespace cho mọi ID node đi bộ để nó không thể xung đột
+    # với các ID trạm chuỗi số nguyên do build_metro.py chỉ định.
     # -----------------------------------------------------------------------
     print(f"--- Namespacing walk node IDs with prefix {WALK_NODE_PREFIX!r} ---")
     g_walk = _namespace_node_ids(g_walk, WALK_NODE_PREFIX)
 
     # -----------------------------------------------------------------------
-    # Step 8: make all attribute values GraphML-serializable, then save.
+    # Bước 8: chuyển mọi giá trị thuộc tính thành định dạng chuẩn để có thể lưu dưới dạng GraphML.
     # -----------------------------------------------------------------------
     _stringify_attr_values(g_walk)
 

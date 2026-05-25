@@ -24,6 +24,7 @@ to_wgs84 = Transformer.from_crs(CRS_METERS, CRS_WGS84, always_xy=True)
 
 BANNED_STATIONS = ["Броневая"]
 
+# Hàm chuyển đổi hình học thành định dạng tọa độ cho Leaflet
 def edge_to_leaflet_coords(segment):
     if segment.geom_type == 'MultiLineString':
         segment = linemerge(segment)
@@ -34,10 +35,12 @@ def edge_to_leaflet_coords(segment):
 # ============================================================
 # 2. LẤY & LỌC DỮ LIỆU
 # ============================================================
+
 print("--- Đang tải dữ liệu Metro ---")
 stations = ox.features_from_place(PLACE_NAME, tags={"station": "subway"}).to_crs(CRS_METERS)
 tracks = ox.features_from_place(PLACE_NAME, tags={"railway": "subway"}).to_crs(CRS_METERS)
 
+#Lọc bỏ các ga và đường ray không hoạt động
 inactive_tags = ['construction', 'proposed', 'planned', 'under_construction', 'disused', 'abandoned']
 if 'status' in stations.columns:
     stations = stations[~stations['status'].isin(inactive_tags)]
@@ -52,6 +55,7 @@ if 'usage' in tracks.columns:
 
 tracks = tracks[tracks.geometry.type.isin(["LineString", "MultiLineString"])]
 
+# Merge các đoạn ray liền kề để tạo thành tuyến dài hơn, giúp chống rẽ nhánh tại trạm trung chuyển
 print("--- Đang xử lý hình học (Merge Tracks) ---")
 merged_tracks = linemerge(tracks.geometry.tolist())
 lines = list(merged_tracks.geoms) if merged_tracks.geom_type == 'MultiLineString' else [merged_tracks]
@@ -59,6 +63,8 @@ lines = list(merged_tracks.geoms) if merged_tracks.geom_type == 'MultiLineString
 # ============================================================
 # 3. XỬ LÝ GA (NODES)
 # ============================================================
+
+# Tạo tên hiển thị cuối cùng cho ga, ưu tiên 'name:en' nếu có, sau đó mới đến 'name'
 stations['final_name'] = stations['name:en'].fillna(stations.get('name', 'Unknown'))
 
 pattern = '|'.join(BANNED_STATIONS)
@@ -74,6 +80,7 @@ for idx, row in st_nodes.iterrows():
 # ============================================================
 # 4. XỬ LÝ TUYẾN (EDGES) - [CHỐNG RẼ NHÁNH TẠI TRẠM TRUNG CHUYỂN]
 # ============================================================
+
 print("--- Đang kết nối mạng lưới ---")
 for line in lines:
     near_st = []
@@ -137,6 +144,8 @@ for line in lines:
 # ============================================================
 # 5. LIÊN THÔNG GA ĐI BỘ (TRANSFER EDGES)
 # ============================================================
+
+#Kết nối tất cả các ga nằm trong bán kính 300m bằng đường đi bộ, giúp A* có nhiều lựa chọn hơn khi tìm đường
 for u, v in itertools.combinations(G.nodes, 2):
     if not G.has_edge(u, v):
         u_idx, v_idx = int(u), int(v)
@@ -153,6 +162,8 @@ for u, v in itertools.combinations(G.nodes, 2):
 # ============================================================
 # 6. AUTO-FIX (BẢO HIỂM CHO A*)
 # ============================================================
+
+# Kiểm tra tính liên thông của đồ thị, nếu có cụm nào bị tách rời thì tự động vá bằng cách nối đường thẳng ngắn nhất giữa cụm đó với cụm chính
 components = list(nx.connected_components(G))
 if len(components) > 1:
     print(f"[*] CẢNH BÁO: Đang vá lỗi liên thông cho {len(components)} cụm...")
@@ -184,6 +195,7 @@ if len(components) > 1:
 # ============================================================
 # 7. XUẤT FILE
 # ============================================================
+
 os.makedirs("graph", exist_ok=True)
 nx.write_graphml(G, OUT_METRO)
 
