@@ -437,7 +437,7 @@
                 return;
             }
             
-            if (adminMode === 'unblock' && blockMethod) {
+            if (adminMode === 'unblock') {
                 handleAdminUnblockClick(lat, lng);
                 return;
             }
@@ -683,7 +683,7 @@
                 unblockBtn.classList.remove('border-green-200', 'bg-green-50', 'text-green-600');
                 methodButtons.forEach(btn => btn.classList.add('hidden'));
                 resetButtons.classList.remove('hidden');
-                document.getElementById('admin-help-text').textContent = 'Chọn phương thức hủy cấm';
+                document.getElementById('admin-help-text').textContent = 'Click vào ga, cạnh, hoặc vùng cấm trên bản đồ để hủy';
             }
         }
 
@@ -846,25 +846,23 @@
         }
 
         async function handleAdminUnblockClick(lat, lng) {
-            if (blockMethod === 'node') {
-                // Find forbidden node to unblock
-                const forbidden_nodes = window.graphData.forbidden_nodes || [];
-                let targetNode = null;
-                let minDist = 0.001; // Small threshold for clicking on node
-                
-                forbidden_nodes.forEach(nodeId => {
-                    const node = window.graphNodeMap.get(nodeId);
-                    if (node) {
-                        const dist = Math.sqrt((node.lat - lat) ** 2 + (node.lng - lng) ** 2);
-                        if (dist < minDist) {
-                            minDist = dist;
-                            targetNode = { id: nodeId, node };
-                        }
+            // Find forbidden node to unblock
+            const forbidden_nodes = window.graphData.forbidden_nodes || [];
+            let targetNode = null;
+            let minDistNode = 0.001; // Small threshold for clicking on node
+            
+            forbidden_nodes.forEach(nodeId => {
+                const node = window.graphNodeMap.get(nodeId);
+                if (node) {
+                    const dist = Math.sqrt((node.lat - lat) ** 2 + (node.lng - lng) ** 2);
+                    if (dist < minDistNode) {
+                        minDistNode = dist;
+                        targetNode = { id: nodeId, node };
                     }
-                });
-                
-                if (!targetNode) return;
-                
+                }
+            });
+            
+            if (targetNode) {
                 try {
                     await fetch('/api/admin/unblock-node', {
                         method: 'POST',
@@ -875,31 +873,32 @@
                 } catch (err) {
                     console.error('Lỗi hủy cấm ga', err);
                 }
-            } else if (blockMethod === 'edge') {
-                // Click directly on a forbidden metro route to unblock the full path
-                const forbidden_edge_routes = window.graphData.forbidden_edge_routes || [];
-                let targetRoute = null;
-                let minDist = 0.002;
+                return;
+            }
 
-                forbidden_edge_routes.forEach(route => {
-                    const coords = route.geometry_coords || [];
-                    for (let i = 0; i < coords.length - 1; i++) {
-                        const current = coords[i];
-                        const next = coords[i + 1];
-                        const currLat = Array.isArray(current) ? current[0] : current.lat;
-                        const currLng = Array.isArray(current) ? current[1] : current.lng;
-                        const nextLat = Array.isArray(next) ? next[0] : next.lat;
-                        const nextLng = Array.isArray(next) ? next[1] : next.lng;
-                        const dist = pointToLineDistance(lat, lng, currLat, currLng, nextLat, nextLng);
-                        if (dist < minDist) {
-                            minDist = dist;
-                            targetRoute = route;
-                        }
+            // Click directly on a forbidden metro route to unblock the full path
+            const forbidden_edge_routes = window.graphData.forbidden_edge_routes || [];
+            let targetRoute = null;
+            let minDistEdge = 0.002;
+
+            forbidden_edge_routes.forEach(route => {
+                const coords = route.geometry_coords || [];
+                for (let i = 0; i < coords.length - 1; i++) {
+                    const current = coords[i];
+                    const next = coords[i + 1];
+                    const currLat = Array.isArray(current) ? current[0] : current.lat;
+                    const currLng = Array.isArray(current) ? current[1] : current.lng;
+                    const nextLat = Array.isArray(next) ? next[0] : next.lat;
+                    const nextLng = Array.isArray(next) ? next[1] : next.lng;
+                    const dist = pointToLineDistance(lat, lng, currLat, currLng, nextLat, nextLng);
+                    if (dist < minDistEdge) {
+                        minDistEdge = dist;
+                        targetRoute = route;
                     }
-                });
+                }
+            });
 
-                if (!targetRoute) return;
-
+            if (targetRoute) {
                 try {
                     await fetch('/api/admin/unblock-edge', {
                         method: 'POST',
@@ -910,27 +909,88 @@
                 } catch (err) {
                     console.error('Lỗi hủy cấm cạnh', err);
                 }
-            } else if (blockMethod === 'zone') {
-                // Click directly on forbidden zone to unblock it
-                const forbidden_zones = window.graphData.forbidden_zones || [];
-                let targetZone = null;
-                let minDist = Infinity;
-                
-                forbidden_zones.forEach((zone) => {
-                    const center = [zone.center_lat, zone.center_lng];
-                    // Calculate distance to circle center
-                    const dist = Math.sqrt((zone.center_lat - lat) ** 2 + (zone.center_lng - lng) ** 2);
-                    const radiusInDegrees = zone.radius;
-                    
-                    // Check if click is inside or near the circle
-                    if (dist <= radiusInDegrees * 1.2 && dist < minDist) {
-                        minDist = dist;
-                        targetZone = zone;
+                return;
+            }
+            
+            // Check if there's any simple edge (not route)
+            const forbidden_edges = window.graphData.forbidden_edges || [];
+            let targetSimpleEdge = null;
+            let minDistSimpleEdge = 0.002;
+
+            forbidden_edges.forEach(edge => {
+                const node1Id = edge[0];
+                const node2Id = edge[1];
+                const n1 = window.graphNodeMap.get(node1Id);
+                const n2 = window.graphNodeMap.get(node2Id);
+                if (n1 && n2) {
+                    const edgeKey = [String(node1Id), String(node2Id)].sort().join('__');
+                    const edgeObj = window.graphEdgeMap.get(edgeKey);
+                    let coords = [[n1.lat, n1.lng], [n2.lat, n2.lng]];
+                    if (edgeObj && edgeObj.geometry_coords && Array.isArray(edgeObj.geometry_coords) && edgeObj.geometry_coords.length > 2) {
+                        coords = edgeObj.geometry_coords.map(coord => {
+                            if (coord && coord.lat !== undefined && coord.lng !== undefined) {
+                                return [coord.lat, coord.lng];
+                            }
+                            if (Array.isArray(coord) && coord.length >= 2) {
+                                return [coord[0], coord[1]];
+                            }
+                            return null;
+                        }).filter(coord => coord !== null);
                     }
-                });
+                    if (coords.length < 2) coords = [[n1.lat, n1.lng], [n2.lat, n2.lng]];
+                    for (let i = 0; i < coords.length - 1; i++) {
+                        const current = coords[i];
+                        const next = coords[i + 1];
+                        const currLat = Array.isArray(current) ? current[0] : current.lat;
+                        const currLng = Array.isArray(current) ? current[1] : current.lng;
+                        const nextLat = Array.isArray(next) ? next[0] : next.lat;
+                        const nextLng = Array.isArray(next) ? next[1] : next.lng;
+                        const dist = pointToLineDistance(lat, lng, currLat, currLng, nextLat, nextLng);
+                        if (dist < minDistSimpleEdge) {
+                            minDistSimpleEdge = dist;
+                            targetSimpleEdge = { node1: node1Id, node2: node2Id };
+                        }
+                    }
+                }
+            });
+
+            if (targetSimpleEdge) {
+                try {
+                    await fetch('/api/admin/unblock-edge', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ node1: targetSimpleEdge.node1, node2: targetSimpleEdge.node2, password: '123456' })
+                    });
+                    loadGraphData();
+                } catch (err) {
+                    console.error('Lỗi hủy cấm cạnh', err);
+                }
+                return;
+            }
+
+            // Click directly on forbidden zone to unblock it
+            const forbidden_zones = window.graphData.forbidden_zones || [];
+            let targetZone = null;
+            let minDistZone = Infinity;
+            
+            forbidden_zones.forEach((zone) => {
+                const center = [zone.center_lat, zone.center_lng];
+                // Calculate distance to circle center
+                const dist = Math.sqrt((zone.center_lat - lat) ** 2 + (zone.center_lng - lng) ** 2);
                 
-                if (!targetZone) return;
+                // Allow clicking slightly outside the actual radius (give margin of error)
+                // Need to convert meters to rough degrees or use exact logic
+                let radiusInDegrees = zone.radius; 
+                // Sometimes backend returns radius in meters directly, but here we assume zone.radius is the value we can compare with dist.
+                // Note: older code did this, let's keep it. (dist <= radiusInDegrees * 1.2)
                 
+                if (dist <= radiusInDegrees * 1.2 && dist < minDistZone) {
+                    minDistZone = dist;
+                    targetZone = zone;
+                }
+            });
+            
+            if (targetZone) {
                 try {
                     await fetch('/api/admin/unblock-zone', {
                         method: 'POST',

@@ -599,14 +599,21 @@ class AppState:
         self._restore_all_edges()
 
     def reset_nodes(self):
+        old_nodes = list(self.forbidden_nodes)
         self.forbidden_nodes = set()
-        self._restore_all_edges()
-        self._reapply_all_blocks()
+        for node_id in old_nodes:
+            if COMBINED_BASE_GRAPH is not None and node_id in COMBINED_BASE_GRAPH:
+                for nb in COMBINED_BASE_GRAPH.neighbors(node_id):
+                    if not self._is_edge_still_blocked(node_id, nb):
+                        self._restore_edge(node_id, nb)
 
     def reset_edges(self):
-        self.forbidden_edges, self.forbidden_edge_routes = set(), []
-        self._restore_all_edges()
-        self._reapply_all_blocks()
+        old_edges = list(self.forbidden_edges)
+        self.forbidden_edges = set()
+        self.forbidden_edge_routes = []
+        for u, v in old_edges:
+            if not self._is_edge_still_blocked(u, v):
+                self._restore_edge(u, v)
 
     def reset_zones(self):
         self.forbidden_zones = []
